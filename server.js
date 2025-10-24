@@ -110,13 +110,28 @@ app.post("/send", async (req, res) => {
 
   try {
     const sock = clients[eid] || await startClient(eid);
-    await sock.sendMessage(`${to}@s.whatsapp.net`, { text: message });
+
+    // normaliza número (remove +, espaços, traços)
+    const cleaned = to.toString().replace(/\D/g, "");
+
+    // resolve ID válido (checa se o número existe no WhatsApp)
+    const [result] = await sock.onWhatsApp(cleaned);
+    if (!result || !result.exists) {
+      return res.json({ success: false, error: "Número não encontrado no WhatsApp." });
+    }
+
+    const jid = result.jid;
+    console.log(`📤 Enviando para ${jid}`);
+
+    await sock.sendMessage(jid, { text: message });
+
     res.json({ success: true });
   } catch (err) {
-    console.error(`Erro ao enviar mensagem:`, err.message);
+    console.error("Erro ao enviar:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
 
 app.get("/", (req, res) => {
   res.send(`
