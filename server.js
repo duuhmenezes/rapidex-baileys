@@ -93,31 +93,31 @@ async function startClient(eid) {
 // ===============================
 async function processarFila() {
   const [mensagens] = await db.query(
-    "SELECT * FROM whats_fila WHERE status = 'pendente' ORDER BY id ASC LIMIT 5"
+    "SELECT * FROM whatsapp_fila WHERE status = 'pendente' ORDER BY id ASC LIMIT 5"
   );
 
   for (const msg of mensagens) {
     const { id, rel_estabelecimentos_id, numero, mensagem } = msg;
     try {
-      await db.query("UPDATE whats_fila SET status='enviando' WHERE id=?", [id]);
+      await db.query("UPDATE whatsapp_fila SET status='enviando' WHERE id=?", [id]);
 
       const sock = clients[rel_estabelecimentos_id] || await startClient(rel_estabelecimentos_id);
       const cleaned = numero.replace(/\D/g, "");
       const [result] = await sock.onWhatsApp(cleaned);
 
       if (!result || !result.exists) {
-        await db.query("UPDATE whats_fila SET status='falhou', retorno='Número não existe' WHERE id=?", [id]);
+        await db.query("UPDATE whatsapp_fila SET status='falhou', retorno='Número não existe' WHERE id=?", [id]);
         continue;
       }
 
       const jid = result.jid;
       await sock.sendMessage(jid, { text: mensagem });
 
-      await db.query("UPDATE whats_fila SET status='enviado', retorno='OK' WHERE id=?", [id]);
+      await db.query("UPDATE whatsapp_fila SET status='enviado', retorno='OK' WHERE id=?", [id]);
       await db.query("INSERT INTO whats_logs (rel_estabelecimentos_id, numero, mensagem, status, resposta) VALUES (?, ?, ?, 'enviado', 'OK')",
         [rel_estabelecimentos_id, numero, mensagem]);
     } catch (err) {
-      await db.query("UPDATE whats_fila SET status='falhou', retorno=? WHERE id=?", [err.message, id]);
+      await db.query("UPDATE whatsapp_fila SET status='falhou', retorno=? WHERE id=?", [err.message, id]);
       await db.query("INSERT INTO whats_logs (rel_estabelecimentos_id, numero, mensagem, status, resposta) VALUES (?, ?, ?, 'falhou', ?)",
         [rel_estabelecimentos_id, numero, mensagem, err.message]);
     }
