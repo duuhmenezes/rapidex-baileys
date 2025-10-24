@@ -114,12 +114,16 @@ async function processarFila() {
       await sock.sendMessage(jid, { text: mensagem });
 
       await db.query("UPDATE whatsapp_fila SET status='enviado', retorno='OK' WHERE id=?", [id]);
-      await db.query("INSERT INTO whats_logs (rel_estabelecimentos_id, numero, mensagem, status, resposta) VALUES (?, ?, ?, 'enviado', 'OK')",
-        [rel_estabelecimentos_id, numero, mensagem]);
+      await db.query(
+        "INSERT INTO whatsapp_logs (rel_estabelecimentos_id, numero, mensagem, status, resposta) VALUES (?, ?, ?, 'enviado', 'OK')",
+        [rel_estabelecimentos_id, numero, mensagem]
+      );
     } catch (err) {
       await db.query("UPDATE whatsapp_fila SET status='falhou', retorno=? WHERE id=?", [err.message, id]);
-      await db.query("INSERT INTO whats_logs (rel_estabelecimentos_id, numero, mensagem, status, resposta) VALUES (?, ?, ?, 'falhou', ?)",
-        [rel_estabelecimentos_id, numero, mensagem, err.message]);
+      await db.query(
+        "INSERT INTO whatsapp_logs (rel_estabelecimentos_id, numero, mensagem, status, resposta) VALUES (?, ?, ?, 'falhou', ?)",
+        [rel_estabelecimentos_id, numero, mensagem, err.message]
+      );
     }
   }
 }
@@ -130,14 +134,41 @@ setInterval(processarFila, 15000);
 // ===============================
 // ROTAS API
 // ===============================
+
+// ➕ Adiciona mensagem à fila
+app.post("/queue", async (req, res) => {
+  const { eid, to, message } = req.body;
+  if (!eid || !to || !message)
+    return res.status(400).json({ error: "Parâmetros obrigatórios faltando." });
+
+  try {
+    await db.query(
+      "INSERT INTO whatsapp_fila (rel_estabelecimentos_id, numero, mensagem) VALUES (?, ?, ?)",
+      [eid, to, message]
+    );
+    res.json({ success: true, message: "Mensagem adicionada à fila." });
+  } catch (err) {
+    console.error("Erro ao inserir na fila:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Status de conexão
+app.get("/status", async (req, res) => {
+  const { eid } = req.query;
+  const file = `${SESSION_DIR}/${eid}_status.txt`;
+  let status = "desconhecido";
+  if (fs.existsSync(file)) status = await fs.readFile(file, "utf8");
+  res.json({ eid, conectado: status === "connected", status });
+});
+
+// QR Code
 app.get("/qr", async (req, res) => {
   const { eid } = req.query;
   if (!eid) return res.status(400).json({ error: "eid obrigatório" });
 
   const file = `${SESSION_DIR}/${eid}_qr.txt`;
-  if (fs.existsSync(file)) {
-    return res.json({ qr: await fs.readFile(file, "utf8") });
-  }
+  if (fs.existsSync(file)) return res.json({ qr: await fs.readFile(file, "utf8") });
 
   await startClient(eid);
   setTimeout(async () => {
@@ -149,18 +180,7 @@ app.get("/qr", async (req, res) => {
   }, 3000);
 });
 
-app.get("/status", async (req, res) => {
-  const { eid } = req.query;
-  const file = `${SESSION_DIR}/${eid}_status.txt`;
-  let status = "desconhecido";
-  if (fs.existsSync(file)) status = await fs.readFile(file, "utf8");
-  res.json({
-    eid,
-    conectado: status === "connected",
-    status,
-  });
-});
-
+// Envio direto (fora da fila)
 app.post("/send", async (req, res) => {
   const { eid, to, message } = req.body;
   if (!eid || !to || !message)
@@ -176,8 +196,6 @@ app.post("/send", async (req, res) => {
     }
 
     const jid = result.jid;
-    console.log(`📤 Enviando para ${jid}`);
-
     await sock.sendMessage(jid, { text: message });
     res.json({ success: true });
   } catch (err) {
@@ -186,16 +204,16 @@ app.post("/send", async (req, res) => {
   }
 });
 
+// Página inicial
 app.get("/", (req, res) => {
   res.send(`
     <h1>🚀 Rapidex WhatsApp Server (Baileys v7)</h1>
-    <p>Status: <a href="/status?eid=1">/status?eid=1</a></p>
-    <p>QR: <a href="/qr?eid=1">/qr?eid=1</a></p>
+    <p>✅ /queue → adiciona à fila</p>
+    <p>🔍 /status?eid=1 → status</p>
+    <p>📸 /qr?eid=1 → QR Code</p>
   `);
 });
 
-// ===============================
-// START SERVER
-// ===============================
+// Inicia servidor
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 Servidor Baileys rodando na porta ${PORT}`));
