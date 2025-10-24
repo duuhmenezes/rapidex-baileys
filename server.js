@@ -7,6 +7,7 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion
 } from "@whiskeysockets/baileys";
+import mysql from "mysql2/promise";
 
 const app = express();
 app.use(express.json());
@@ -16,15 +17,31 @@ app.use(cors({
   allowedHeaders: ["Content-Type"],
 }));
 
+// ===============================
+// BANCO DE DADOS
+// ===============================
+const db = await mysql.createPool({
+  host: "zeus.hostsrv.org",
+  user: "rapidexapp_api",
+  password: "OFgRk?wM1E.J",
+  database: "rapidexapp_sistema"
+});
+
+// ===============================
+// VARIÁVEIS GLOBAIS
+// ===============================
 const SESSION_DIR = "./sessions";
 if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR);
 
 const clients = {};
 
+// ===============================
+// FUNÇÃO DE CONEXÃO BAILEYS
+// ===============================
 async function startClient(eid) {
   const sessionPath = `${SESSION_DIR}/${eid}`;
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-  const { version } = await fetchLatestBaileysVersion(); // garante compatibilidade
+  const { version } = await fetchLatestBaileysVersion();
 
   console.log(`🟡 Iniciando sessão ${eid}...`);
 
@@ -71,7 +88,48 @@ async function startClient(eid) {
   return sock;
 }
 
-// ===================== ROTAS =====================
+// ===============================
+// PROCESSAMENTO DA FILA
+// ===============================
+async function processarFila() {
+  const [mensagens] = await db.query(
+    "SELECT * FROM whats_fila WHERE status = 'pendente' ORDER BY id ASC LIMIT 5"
+  );
+
+  for (const msg of mensagens) {
+    const { id, rel_estabelecimentos_id, numero, mensagem } = msg;
+    try {
+      await db.query("UPDATE whats_fila SET status='enviando' WHERE id=?", [id]);
+
+      const sock = clients[rel_estabelecimentos_id] || await startClient(rel_estabelecimentos_id);
+      const cleaned = numero.replace(/\D/g, "");
+      const [result] = await sock.onWhatsApp(cleaned);
+
+      if (!result || !result.exists) {
+        await db.query("UPDATE whats_fila SET status='falhou', retorno='Número não existe' WHERE id=?", [id]);
+        continue;
+      }
+
+      const jid = result.jid;
+      await sock.sendMessage(jid, { text: mensagem });
+
+      await db.query("UPDATE whats_fila SET status='enviado', retorno='OK' WHERE id=?", [id]);
+      await db.query("INSERT INTO whats_logs (rel_estabelecimentos_id, numero, mensagem, status, resposta) VALUES (?, ?, ?, 'enviado', 'OK')",
+        [rel_estabelecimentos_id, numero, mensagem]);
+    } catch (err) {
+      await db.query("UPDATE whats_fila SET status='falhou', retorno=? WHERE id=?", [err.message, id]);
+      await db.query("INSERT INTO whats_logs (rel_estabelecimentos_id, numero, mensagem, status, resposta) VALUES (?, ?, ?, 'falhou', ?)",
+        [rel_estabelecimentos_id, numero, mensagem, err.message]);
+    }
+  }
+}
+
+// Executa a cada 15 segundos
+setInterval(processarFila, 15000);
+
+// ===============================
+// ROTAS API
+// ===============================
 app.get("/qr", async (req, res) => {
   const { eid } = req.query;
   if (!eid) return res.status(400).json({ error: "eid obrigatório" });
@@ -110,12 +168,9 @@ app.post("/send", async (req, res) => {
 
   try {
     const sock = clients[eid] || await startClient(eid);
-
-    // normaliza número (remove +, espaços, traços)
     const cleaned = to.toString().replace(/\D/g, "");
-
-    // resolve ID válido (checa se o número existe no WhatsApp)
     const [result] = await sock.onWhatsApp(cleaned);
+
     if (!result || !result.exists) {
       return res.json({ success: false, error: "Número não encontrado no WhatsApp." });
     }
@@ -124,14 +179,12 @@ app.post("/send", async (req, res) => {
     console.log(`📤 Enviando para ${jid}`);
 
     await sock.sendMessage(jid, { text: message });
-
     res.json({ success: true });
   } catch (err) {
     console.error("Erro ao enviar:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
-
 
 app.get("/", (req, res) => {
   res.send(`
@@ -141,5 +194,8 @@ app.get("/", (req, res) => {
   `);
 });
 
+// ===============================
+// START SERVER
+// ===============================
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 Servidor Baileys rodando na porta ${PORT}`));
