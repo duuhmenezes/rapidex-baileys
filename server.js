@@ -109,11 +109,28 @@ async function readStatus(eid) {
   if (sessionStatus[eid]) {
     return sessionStatus[eid];
   }
+  if (clients[eid]) {
+    return "connecting";
+  }
   const file = statusFile(eid);
   if (await fs.pathExists(file)) {
     return String(await fs.readFile(file, "utf8")).trim();
   }
   return "disconnected";
+}
+
+async function hasSavedSession(eid) {
+  return fs.pathExists(`${sessionPath(eid)}/creds.json`);
+}
+
+async function clearSession(eid) {
+  delete clients[eid];
+  delete sessionStatus[eid];
+  starting.delete(eid);
+  await fs.remove(sessionPath(eid)).catch(() => {});
+  await fs.remove(statusFile(eid)).catch(() => {});
+  await fs.remove(qrFile(eid)).catch(() => {});
+  await upsertSession(eid, { status: "disconnected", last_qr: null });
 }
 
 function normalizePhone(raw) {
@@ -324,11 +341,14 @@ async function startClient(rawEid) {
         await upsertSession(eid, { status: "disconnected" });
         delete clients[eid];
 
-        if (reason !== DisconnectReason.loggedOut) {
-          setTimeout(() => {
-            if (!clients[eid]) startClient(eid).catch(() => {});
-          }, 5000);
+        if (reason === DisconnectReason.loggedOut) {
+          await clearSession(eid);
+          return;
         }
+
+        setTimeout(() => {
+          if (!clients[eid]) startClient(eid).catch(() => {});
+        }, 5000);
       }
     });
 
@@ -393,10 +413,16 @@ app.get("/status", async (req, res) => {
     return res.status(400).json({ success: false, error: "eid_required" });
   }
 
-  const status = await readStatus(eid);
-  const conectado = status === "connected";
+  let status = await readStatus(eid);
 
-  res.json({ eid, status, conectado });
+  if (status !== "connected" && !clients[eid] && !starting.has(eid)) {
+    startClient(eid).catch(() => {});
+    status = sessionStatus[eid] || "connecting";
+  } else if (clients[eid] && status === "disconnected") {
+    status = sessionStatus[eid] || "connecting";
+  }
+
+  res.json({ eid, status, conectado: status === "connected" });
 });
 
 app.get("/qr", async (req, res) => {
@@ -412,14 +438,29 @@ app.get("/qr", async (req, res) => {
 
   await startClient(eid);
 
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 500));
     if (await fs.pathExists(file)) {
       return res.json({ qr: await fs.readFile(file, "utf8") });
     }
+    if ((await readStatus(eid)) === "connected") {
+      return res.json({ qr: null, status: "connected" });
+    }
   }
 
-  res.json({ qr: null });
+  // Credenciais antigas podem impedir novo QR — força sessão limpa
+  if (await hasSavedSession(eid)) {
+    await clearSession(eid);
+    await startClient(eid);
+    for (let i = 0; i < 16; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (await fs.pathExists(file)) {
+        return res.json({ qr: await fs.readFile(file, "utf8"), reset: true });
+      }
+    }
+  }
+
+  res.json({ qr: null, status: await readStatus(eid) });
 });
 
 app.post("/send", async (req, res) => {
