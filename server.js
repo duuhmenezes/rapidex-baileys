@@ -145,7 +145,31 @@ function messagePlaceholder(msg) {
   return "";
 }
 
-async function forwardToRapidex(eid, numero, message, fromMe, pushName) {
+function resolveContact(msg) {
+  const remoteJid = String(msg.key?.remoteJid || "");
+  const altJid = String(msg.key?.remoteJidAlt || msg.key?.participant || "");
+
+  if (remoteJid.endsWith("@s.whatsapp.net")) {
+    return {
+      jid: remoteJid,
+      phone: remoteJid.split("@")[0].replace(/\D/g, ""),
+    };
+  }
+
+  if (altJid.endsWith("@s.whatsapp.net")) {
+    return {
+      jid: remoteJid,
+      phone: altJid.split("@")[0].replace(/\D/g, ""),
+    };
+  }
+
+  return {
+    jid: remoteJid,
+    phone: remoteJid.split("@")[0].replace(/\D/g, ""),
+  };
+}
+
+async function forwardToRapidex(eid, numero, message, fromMe, pushName, jid = "") {
   if (!WEBHOOK_TOKEN || !message) return;
 
   try {
@@ -156,6 +180,7 @@ async function forwardToRapidex(eid, numero, message, fromMe, pushName) {
         token: WEBHOOK_TOKEN,
         eid: Number(eid),
         from: numero,
+        jid: jid || "",
         message,
         fromMe: !!fromMe,
         pushName: pushName || "",
@@ -204,17 +229,12 @@ async function maybeForwardToGroup(sock, eid, remoteJid, msg, numero, texto) {
   }
 }
 
-async function sendTextMessage(eid, to, message) {
+async function sendTextMessage(eid, to, message, jid = "") {
   const key = String(eid);
   const status = await readStatus(key);
 
   if (status !== "connected" || !clients[key]) {
     return { success: false, error: "not_connected" };
-  }
-
-  const phone = normalizePhone(to);
-  if (!phone) {
-    return { success: false, error: "invalid_number" };
   }
 
   const text = String(message || "").trim();
@@ -224,6 +244,18 @@ async function sendTextMessage(eid, to, message) {
 
   try {
     const sock = clients[key];
+    const targetJid = String(jid || "").trim();
+
+    if (targetJid.includes("@")) {
+      await sock.sendMessage(targetJid, { text });
+      return { success: true };
+    }
+
+    const phone = normalizePhone(to);
+    if (!phone) {
+      return { success: false, error: "invalid_number" };
+    }
+
     const [result] = await sock.onWhatsApp(phone);
     if (!result?.exists) {
       return { success: false, error: "number_not_found" };
@@ -310,14 +342,16 @@ async function startClient(rawEid) {
         const remoteJid = msg.key.remoteJid;
         if (remoteJid.endsWith("@g.us") || remoteJid.endsWith("@broadcast")) return;
 
-        const numero = remoteJid.replace(/\D/g, "");
-        if (!numero) return;
+        const contact = resolveContact(msg);
+        const numero = contact.phone;
+        const waJid = contact.jid;
+        if (!numero || !waJid) return;
 
         const texto = messagePlaceholder(msg);
         const fromMe = !!msg.key.fromMe;
         const pushName = msg.pushName || "";
 
-        forwardToRapidex(eid, numero, texto, fromMe, pushName).catch(() => {});
+        forwardToRapidex(eid, numero, texto, fromMe, pushName, waJid).catch(() => {});
         maybeForwardToGroup(sock, eid, remoteJid, msg, numero, texto).catch(() => {});
       } catch (err) {
         console.error(`messages.upsert ${eid}:`, err.message);
@@ -392,12 +426,13 @@ app.post("/send", async (req, res) => {
   const eid = String(req.body?.eid || "").trim();
   const to = req.body?.to;
   const message = req.body?.message;
+  const jid = String(req.body?.jid || "").trim();
 
-  if (!eid || !to || !message) {
+  if (!eid || !message || (!to && !jid)) {
     return res.status(400).json({ success: false, error: "missing_params" });
   }
 
-  const result = await sendTextMessage(eid, to, message);
+  const result = await sendTextMessage(eid, to, message, jid);
   if (!result.success) {
     return res.status(result.error === "not_connected" ? 503 : 400).json(result);
   }
