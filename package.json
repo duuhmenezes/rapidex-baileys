@@ -1,0 +1,21 @@
+{
+  "name": "rapidex-baileys",
+  "version": "2.1.0",
+  "description": "Servico WhatsApp (Baileys) para o Rapidex",
+  "main": "server.js",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc.6",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "fs-extra": "^11.2.0",
+    "mysql2": "^3.15.3",
+    "qrcode": "^1.5.4"
+  }
+}
