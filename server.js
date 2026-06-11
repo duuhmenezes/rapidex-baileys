@@ -13,8 +13,22 @@ const SESSION_DIR = process.env.SESSION_DIR || "./sessions";
 const WEBHOOK_URL =
   process.env.WHATS_WEBHOOK_URL ||
   "https://rapidex.app.br/api/whatsapp/inbound.php";
+const HISTORY_WEBHOOK_URL =
+  process.env.WHATS_HISTORY_WEBHOOK_URL ||
+  WEBHOOK_URL.replace(/inbound\.php$/i, "history.php");
 const WEBHOOK_TOKEN = (process.env.WHATS_WEBHOOK_TOKEN || "").trim();
+const API_TOKEN = (process.env.BAILEYS_API_TOKEN || "").trim();
 const FORWARD_GROUP = (process.env.WHATS_FORWARD_GROUP || "").trim();
+const SYNC_FULL_HISTORY =
+  (process.env.WHATS_SYNC_FULL_HISTORY || "true").toLowerCase() !== "false";
+const HISTORY_BATCH_SIZE = Math.max(
+  10,
+  Math.min(100, Number(process.env.WHATS_HISTORY_BATCH_SIZE || 80))
+);
+const HISTORY_SYNC_TIMEOUT_MS = Math.max(
+  15000,
+  Math.min(180000, Number(process.env.WHATS_HISTORY_SYNC_TIMEOUT_MS || 90000))
+);
 
 const corsOrigins = (process.env.CORS_ORIGINS || "")
   .split(",")
@@ -22,14 +36,14 @@ const corsOrigins = (process.env.CORS_ORIGINS || "")
   .filter(Boolean);
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 app.use(
   cors({
     origin: corsOrigins.length
       ? corsOrigins
       : ["https://rapidex.app.br", "https://painel.rapidex.app.br"],
     methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
@@ -55,6 +69,27 @@ await fs.ensureDir(SESSION_DIR);
 const clients = Object.create(null);
 const sessionStatus = Object.create(null);
 const starting = new Set();
+const lidToPhone = new Map();
+const activeHistorySync = Object.create(null);
+
+function requireApiAuth(req, res, next) {
+  if (!API_TOKEN || req.path === "/health") {
+    return next();
+  }
+
+  const header = String(req.headers.authorization || "");
+  const bearer = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  const queryToken = String(req.query.token || "").trim();
+  const token = bearer || queryToken;
+
+  if (token !== API_TOKEN) {
+    return res.status(401).json({ ok: false, success: false, error: "unauthorized" });
+  }
+
+  return next();
+}
+
+app.use(requireApiAuth);
 
 async function ensureSessionTable() {
   await db.query(`
@@ -112,6 +147,9 @@ async function readStatus(eid) {
   if (clients[eid]) {
     return "connecting";
   }
+  if (await fs.pathExists(qrFile(eid))) {
+    return "qr_pending";
+  }
   const file = statusFile(eid);
   if (await fs.pathExists(file)) {
     return String(await fs.readFile(file, "utf8")).trim();
@@ -127,6 +165,7 @@ async function clearSession(eid) {
   delete clients[eid];
   delete sessionStatus[eid];
   starting.delete(eid);
+  finishHistorySync(eid, "Sessao encerrada.", true);
   await fs.remove(sessionPath(eid)).catch(() => {});
   await fs.remove(statusFile(eid)).catch(() => {});
   await fs.remove(qrFile(eid)).catch(() => {});
@@ -137,6 +176,31 @@ function normalizePhone(raw) {
   const digits = String(raw || "").replace(/\D/g, "");
   if (!digits) return "";
   return digits.startsWith("55") ? digits : `55${digits}`;
+}
+
+function shouldSkipJid(jid) {
+  const id = String(jid || "");
+  return (
+    !id ||
+    id.endsWith("@g.us") ||
+    id.endsWith("@broadcast") ||
+    id === "status@broadcast"
+  );
+}
+
+function parseMessageTimestamp(msg) {
+  const raw = msg?.messageTimestamp;
+  if (raw == null) return 0;
+  if (typeof raw === "number") {
+    return raw > 9999999999 ? Math.floor(raw / 1000) : raw;
+  }
+  if (typeof raw === "object" && typeof raw.toNumber === "function") {
+    const n = raw.toNumber();
+    return n > 9999999999 ? Math.floor(n / 1000) : n;
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n > 9999999999 ? Math.floor(n / 1000) : n;
 }
 
 function extractMessageText(msg) {
@@ -159,6 +223,8 @@ function messagePlaceholder(msg) {
   if (msg.message?.audioMessage) return "[audio]";
   if (msg.message?.documentMessage) return "[documento]";
   if (msg.message?.stickerMessage) return "[sticker]";
+  if (msg.message?.locationMessage) return "[localizacao]";
+  if (msg.message?.contactMessage) return "[contato]";
   return "";
 }
 
@@ -180,13 +246,56 @@ function resolveContact(msg) {
     };
   }
 
+  if (remoteJid.endsWith("@lid")) {
+    const mapped = lidToPhone.get(remoteJid);
+    if (mapped) {
+      return { jid: remoteJid, phone: mapped.replace(/\D/g, "") };
+    }
+  }
+
+  if (altJid.endsWith("@lid")) {
+    const mapped = lidToPhone.get(altJid);
+    if (mapped) {
+      return { jid: remoteJid, phone: mapped.replace(/\D/g, "") };
+    }
+  }
+
+  const fallback = remoteJid.split("@")[0].replace(/\D/g, "");
   return {
     jid: remoteJid,
-    phone: remoteJid.split("@")[0].replace(/\D/g, ""),
+    phone: fallback.length >= 10 ? fallback : "",
   };
 }
 
-async function forwardToRapidex(eid, numero, message, fromMe, pushName, jid = "") {
+function messageToPayload(msg) {
+  if (!msg?.message || !msg.key?.remoteJid || shouldSkipJid(msg.key.remoteJid)) {
+    return null;
+  }
+
+  const contact = resolveContact(msg);
+  const texto = messagePlaceholder(msg);
+  if (!contact.phone || !texto) return null;
+
+  return {
+    from: contact.phone,
+    jid: contact.jid,
+    message: texto,
+    fromMe: !!msg.key.fromMe,
+    pushName: msg.pushName || msg.verifiedBizName || "",
+    msgId: String(msg.key.id || ""),
+    timestamp: parseMessageTimestamp(msg),
+  };
+}
+
+async function forwardToRapidex(
+  eid,
+  numero,
+  message,
+  fromMe,
+  pushName,
+  jid = "",
+  msgId = ""
+) {
   if (!WEBHOOK_TOKEN || !message) return;
 
   try {
@@ -201,6 +310,7 @@ async function forwardToRapidex(eid, numero, message, fromMe, pushName, jid = ""
         message,
         fromMe: !!fromMe,
         pushName: pushName || "",
+        msgId: msgId || "",
       }),
     });
     if (!res.ok) {
@@ -209,6 +319,151 @@ async function forwardToRapidex(eid, numero, message, fromMe, pushName, jid = ""
   } catch (err) {
     console.error(`webhook ${eid}:`, err.message);
   }
+}
+
+function finishHistorySync(eid, msg = "Historico sincronizado.", force = false) {
+  const sync = activeHistorySync[eid];
+  if (!sync) return null;
+
+  if (!force && sync.pendingBatches > 0) {
+    clearTimeout(sync.timer);
+    sync.timer = setTimeout(() => finishHistorySync(eid, msg), 6000);
+    return null;
+  }
+
+  if (sync.done) return null;
+  sync.done = true;
+  clearTimeout(sync.timer);
+
+  const result = {
+    ok: true,
+    success: true,
+    imported: sync.imported,
+    skipped: sync.skipped,
+    msg: msg || "Historico sincronizado.",
+  };
+
+  sync.resolve(result);
+  delete activeHistorySync[eid];
+  return result;
+}
+
+function beginHistorySync(eid) {
+  if (activeHistorySync[eid]) {
+    return activeHistorySync[eid].promise;
+  }
+
+  let resolvePromise;
+  const promise = new Promise((resolve) => {
+    resolvePromise = resolve;
+  });
+
+  activeHistorySync[eid] = {
+    imported: 0,
+    skipped: 0,
+    pendingBatches: 0,
+    done: false,
+    resolve: resolvePromise,
+    promise,
+    timer: setTimeout(
+      () =>
+        finishHistorySync(
+          eid,
+          "Tempo esgotado — historico parcial importado."
+        ),
+      HISTORY_SYNC_TIMEOUT_MS
+    ),
+  };
+
+  return promise;
+}
+
+async function forwardHistoryBatch(eid, messages) {
+  if (!WEBHOOK_TOKEN || !messages?.length) {
+    return { imported: 0, skipped: 0 };
+  }
+
+  const payloads = messages
+    .map((msg) => messageToPayload(msg))
+    .filter(Boolean);
+
+  if (!payloads.length) {
+    return { imported: 0, skipped: messages.length };
+  }
+
+  const sync = activeHistorySync[eid];
+  if (sync) sync.pendingBatches += 1;
+
+  let imported = 0;
+  let skipped = 0;
+
+  try {
+    for (let i = 0; i < payloads.length; i += HISTORY_BATCH_SIZE) {
+      const chunk = payloads.slice(i, i + HISTORY_BATCH_SIZE);
+      try {
+        const res = await fetch(HISTORY_WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            token: WEBHOOK_TOKEN,
+            eid: Number(eid),
+            messages: chunk,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          imported += Number(data.imported ?? chunk.length);
+          skipped += Number(data.skipped ?? 0);
+        } else {
+          skipped += chunk.length;
+          console.error(`history webhook ${eid}: HTTP ${res.status}`);
+        }
+      } catch (err) {
+        skipped += chunk.length;
+        console.error(`history webhook ${eid}:`, err.message);
+      }
+    }
+  } finally {
+    if (sync) {
+      sync.imported += imported;
+      sync.skipped += skipped;
+      sync.pendingBatches = Math.max(0, sync.pendingBatches - 1);
+      if (sync.pendingBatches === 0) {
+        clearTimeout(sync.timer);
+        sync.timer = setTimeout(
+          () => finishHistorySync(eid, "Historico sincronizado."),
+          5000
+        );
+      }
+    }
+  }
+
+  return { imported, skipped };
+}
+
+async function processLiveMessage(sock, eid, msg) {
+  if (!msg?.message || !msg.key?.remoteJid || shouldSkipJid(msg.key.remoteJid)) {
+    return;
+  }
+
+  const contact = resolveContact(msg);
+  const numero = contact.phone;
+  const waJid = contact.jid;
+  if (!numero || !waJid) return;
+
+  const texto = messagePlaceholder(msg);
+  if (!texto) return;
+
+  const fromMe = !!msg.key.fromMe;
+  const pushName = msg.pushName || "";
+  const msgId = String(msg.key.id || "");
+
+  forwardToRapidex(eid, numero, texto, fromMe, pushName, waJid, msgId).catch(
+    () => {}
+  );
+  maybeForwardToGroup(sock, eid, msg.key.remoteJid, msg, numero, texto).catch(
+    () => {}
+  );
 }
 
 async function maybeForwardToGroup(sock, eid, remoteJid, msg, numero, texto) {
@@ -285,6 +540,103 @@ async function sendTextMessage(eid, to, message, jid = "") {
   }
 }
 
+async function requestHistoryForConversas(eid, sock) {
+  const [rows] = await db.query(
+    `SELECT c.numero, c.wa_jid
+     FROM whatsapp_conversas c
+     WHERE c.rel_estabelecimentos_id=?
+     ORDER BY c.atualizado_em DESC
+     LIMIT 40`,
+    [eid]
+  );
+
+  if (!rows.length) {
+    return { requested: 0, note: "sem_conversas" };
+  }
+
+  let requested = 0;
+
+  for (const row of rows) {
+    const phone = normalizePhone(row.numero);
+    const jid =
+      String(row.wa_jid || "").trim() ||
+      (phone ? `${phone}@s.whatsapp.net` : "");
+    if (!jid || shouldSkipJid(jid)) continue;
+
+    const [msgs] = await db.query(
+      `SELECT m.wa_msg_id, m.criado_em, m.direcao
+       FROM whatsapp_chat_mensagens m
+       INNER JOIN whatsapp_conversas c ON c.id = m.rel_conversa_id
+       WHERE c.rel_estabelecimentos_id=? AND c.numero=?
+         AND m.wa_msg_id IS NOT NULL AND m.wa_msg_id != ''
+       ORDER BY m.id ASC
+       LIMIT 1`,
+      [eid, row.numero]
+    );
+
+    if (!msgs.length) continue;
+
+    const oldest = msgs[0];
+    const tsMs = new Date(oldest.criado_em).getTime();
+    if (!Number.isFinite(tsMs) || tsMs <= 0) continue;
+
+    try {
+      await sock.fetchMessageHistory(
+        50,
+        {
+          remoteJid: jid,
+          id: String(oldest.wa_msg_id),
+          fromMe: oldest.direcao === "out",
+        },
+        tsMs
+      );
+      requested += 1;
+    } catch (err) {
+      console.error(`fetchHistory ${eid}/${jid}:`, err.message);
+    }
+  }
+
+  return { requested, note: requested > 0 ? "ok" : "sem_ancora" };
+}
+
+async function syncHistoryForEid(rawEid) {
+  const eid = String(rawEid);
+  const status = await readStatus(eid);
+
+  if (status !== "connected" || !clients[eid]) {
+    return {
+      ok: false,
+      success: false,
+      error: "not_connected",
+      msg: "WhatsApp nao esta conectado. Escaneie o QR em Conexao QR.",
+    };
+  }
+
+  const waiter = beginHistorySync(eid);
+  const { requested, note } = await requestHistoryForConversas(
+    eid,
+    clients[eid]
+  );
+
+  if (note === "sem_conversas") {
+    finishHistorySync(
+      eid,
+      "Nenhuma conversa salva ainda. O historico e importado automaticamente ao conectar — aguarde alguns minutos.",
+      true
+    );
+  } else if (note === "sem_ancora") {
+    finishHistorySync(
+      eid,
+      "Aguardando importacao automatica do historico. Se acabou de conectar, aguarde 1–2 minutos e tente novamente.",
+      true
+    );
+  } else if (requested === 0) {
+    finishHistorySync(eid, "Nenhuma conversa elegivel para sync manual.", true);
+  }
+
+  return waiter;
+}
+
 async function startClient(rawEid) {
   const eid = String(rawEid);
   if (clients[eid]) return clients[eid];
@@ -307,7 +659,7 @@ async function startClient(rawEid) {
       auth: state,
       printQRInTerminal: false,
       browser: ["Rapidex", "Chrome", "120.0"],
-      syncFullHistory: false,
+      syncFullHistory: SYNC_FULL_HISTORY,
       markOnlineOnConnect: false,
     });
 
@@ -319,9 +671,9 @@ async function startClient(rawEid) {
       if (qr) {
         const qrData = await qrcode.toDataURL(qr);
         await fs.writeFile(qrFile(eid), qrData);
-        await fs.writeFile(statusFile(eid), "disconnected");
-        sessionStatus[eid] = "disconnected";
-        await upsertSession(eid, { status: "disconnected", last_qr: qrData });
+        await fs.writeFile(statusFile(eid), "qr_pending");
+        sessionStatus[eid] = "qr_pending";
+        await upsertSession(eid, { status: "qr_pending", last_qr: qrData });
         console.log(`QR gerado para loja ${eid}`);
       }
 
@@ -354,25 +706,44 @@ async function startClient(rawEid) {
 
     sock.ev.on("creds.update", saveCreds);
 
-    sock.ev.on("messages.upsert", async ({ messages }) => {
+    sock.ev.on("lid-mapping.update", ({ lid, pn }) => {
+      const lidJid = String(lid || "");
+      const phone = normalizePhone(pn);
+      if (lidJid && phone) {
+        lidToPhone.set(lidJid, phone);
+      }
+    });
+
+    sock.ev.on("messaging-history.set", async ({ messages, isLatest, progress }) => {
       try {
-        const msg = messages?.[0];
-        if (!msg?.message || !msg.key?.remoteJid) return;
+        const batch = (messages || []).filter(
+          (msg) => msg?.message && msg.key?.remoteJid && !shouldSkipJid(msg.key.remoteJid)
+        );
+        if (!batch.length) {
+          if (isLatest) finishHistorySync(eid, "Historico sincronizado.");
+          return;
+        }
 
-        const remoteJid = msg.key.remoteJid;
-        if (remoteJid.endsWith("@g.us") || remoteJid.endsWith("@broadcast")) return;
+        console.log(
+          `history ${eid}: ${batch.length} msgs (latest=${!!isLatest}, progress=${progress ?? "?"})`
+        );
+        await forwardHistoryBatch(eid, batch);
 
-        const contact = resolveContact(msg);
-        const numero = contact.phone;
-        const waJid = contact.jid;
-        if (!numero || !waJid) return;
+        if (isLatest) {
+          finishHistorySync(eid, "Historico sincronizado.");
+        }
+      } catch (err) {
+        console.error(`messaging-history.set ${eid}:`, err.message);
+      }
+    });
 
-        const texto = messagePlaceholder(msg);
-        const fromMe = !!msg.key.fromMe;
-        const pushName = msg.pushName || "";
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (type !== "notify") return;
 
-        forwardToRapidex(eid, numero, texto, fromMe, pushName, waJid).catch(() => {});
-        maybeForwardToGroup(sock, eid, remoteJid, msg, numero, texto).catch(() => {});
+      try {
+        for (const msg of messages || []) {
+          await processLiveMessage(sock, eid, msg);
+        }
       } catch (err) {
         console.error(`messages.upsert ${eid}:`, err.message);
       }
@@ -404,7 +775,7 @@ async function restoreSessions() {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "rapidex-baileys" });
+  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.0" });
 });
 
 app.get("/status", async (req, res) => {
@@ -415,14 +786,24 @@ app.get("/status", async (req, res) => {
 
   let status = await readStatus(eid);
 
-  if (status !== "connected" && !clients[eid] && !starting.has(eid)) {
+  if (
+    status !== "connected" &&
+    status !== "qr_pending" &&
+    !clients[eid] &&
+    !starting.has(eid)
+  ) {
     startClient(eid).catch(() => {});
     status = sessionStatus[eid] || "connecting";
   } else if (clients[eid] && status === "disconnected") {
     status = sessionStatus[eid] || "connecting";
   }
 
-  res.json({ eid, status, conectado: status === "connected" });
+  res.json({
+    eid,
+    status,
+    conectado: status === "connected",
+    qr_pending: status === "qr_pending",
+  });
 });
 
 app.get("/qr", async (req, res) => {
@@ -433,7 +814,7 @@ app.get("/qr", async (req, res) => {
 
   const file = qrFile(eid);
   if (await fs.pathExists(file)) {
-    return res.json({ qr: await fs.readFile(file, "utf8") });
+    return res.json({ qr: await fs.readFile(file, "utf8"), status: "qr_pending" });
   }
 
   await startClient(eid);
@@ -441,21 +822,24 @@ app.get("/qr", async (req, res) => {
   for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 500));
     if (await fs.pathExists(file)) {
-      return res.json({ qr: await fs.readFile(file, "utf8") });
+      return res.json({ qr: await fs.readFile(file, "utf8"), status: "qr_pending" });
     }
     if ((await readStatus(eid)) === "connected") {
       return res.json({ qr: null, status: "connected" });
     }
   }
 
-  // Credenciais antigas podem impedir novo QR — força sessão limpa
   if (await hasSavedSession(eid)) {
     await clearSession(eid);
     await startClient(eid);
     for (let i = 0; i < 16; i++) {
       await new Promise((r) => setTimeout(r, 500));
       if (await fs.pathExists(file)) {
-        return res.json({ qr: await fs.readFile(file, "utf8"), reset: true });
+        return res.json({
+          qr: await fs.readFile(file, "utf8"),
+          status: "qr_pending",
+          reset: true,
+        });
       }
     }
   }
@@ -481,6 +865,57 @@ app.post("/send", async (req, res) => {
   res.json(result);
 });
 
+app.post("/sync-history", async (req, res) => {
+  const eid = String(req.query.eid || req.body?.eid || "").trim();
+  if (!eid) {
+    return res.status(400).json({ ok: false, success: false, error: "eid_required" });
+  }
+
+  if (activeHistorySync[eid] && !activeHistorySync[eid].done) {
+    return res.status(409).json({
+      ok: false,
+      success: false,
+      msg: "Sync de historico ja em andamento para esta loja.",
+    });
+  }
+
+  try {
+    const result = await syncHistoryForEid(eid);
+    res.json(result);
+  } catch (err) {
+    console.error(`sync-history ${eid}:`, err.message);
+    res.status(500).json({
+      ok: false,
+      success: false,
+      msg: "Erro ao sincronizar historico.",
+    });
+  }
+});
+
+app.post("/disconnect", async (req, res) => {
+  const eid = String(req.query.eid || req.body?.eid || "").trim();
+  if (!eid) {
+    return res.status(400).json({ success: false, error: "eid_required" });
+  }
+
+  try {
+    const sock = clients[eid];
+    if (sock) {
+      try {
+        await sock.logout();
+      } catch {
+        /* ignore */
+      }
+    }
+    await clearSession(eid);
+    res.json({ success: true, ok: true, status: "disconnected" });
+  } catch (err) {
+    console.error(`disconnect ${eid}:`, err.message);
+    res.status(500).json({ success: false, error: "disconnect_failed" });
+  }
+});
+
+/** @deprecated Preferir fila PHP + cron Rapidex */
 app.post("/queue", async (req, res) => {
   const eid = Number(req.body?.eid || 0);
   const to = String(req.body?.to || "").replace(/\D/g, "");
@@ -497,7 +932,7 @@ app.post("/queue", async (req, res) => {
     [eid, to, message]
   );
 
-  res.json({ success: true });
+  res.json({ success: true, deprecated: true });
 });
 
 await ensureSessionTable();
@@ -505,8 +940,14 @@ await restoreSessions();
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.2.0 na porta ${PORT}`);
+  console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   if (!WEBHOOK_TOKEN) {
-    console.warn("WHATS_WEBHOOK_TOKEN ausente: bot/inbox do painel nao recebera mensagens.");
+    console.warn(
+      "WHATS_WEBHOOK_TOKEN ausente: bot/inbox do painel nao recebera mensagens."
+    );
+  }
+  if (API_TOKEN) {
+    console.log("BAILEYS_API_TOKEN ativo — endpoints protegidos.");
   }
 });
