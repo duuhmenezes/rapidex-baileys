@@ -6,6 +6,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  Browsers,
 } from "@whiskeysockets/baileys";
 import mysql from "mysql2/promise";
 
@@ -106,6 +107,33 @@ function rememberLidPhone(eid, lid, phone) {
   if (!lidJid || !normalized) return;
   getLidMap(eid).set(lidJid, normalized);
   saveLidMap(eid).catch(() => {});
+}
+
+function chatsCacheFile(eid) {
+  return `${sessionPath(eid)}/chats-cache.json`;
+}
+
+async function loadChatsCache(eid) {
+  try {
+    const data = await fs.readJson(chatsCacheFile(eid));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+async function mergeChatsCache(eid, incoming) {
+  if (!incoming?.length) return;
+  const current = await loadChatsCache(eid);
+  const byId = new Map(current.map((c) => [String(c.id || ""), c]));
+  for (const chat of incoming) {
+    const id = String(chat?.id || "");
+    if (!id) continue;
+    byId.set(id, { ...(byId.get(id) || {}), ...chat, id });
+  }
+  await fs
+    .writeJson(chatsCacheFile(eid), Array.from(byId.values()).slice(0, 500))
+    .catch(() => {});
 }
 
 function requireApiAuth(req, res, next) {
@@ -539,6 +567,9 @@ async function forwardHistoryBatch(eid, messages) {
     .filter(Boolean);
 
   if (!payloads.length) {
+    console.warn(
+      `history ${eid}: ${messages.length} msgs recebidas mas 0 com telefone valido (LID sem mapa?)`
+    );
     return { imported: 0, skipped: messages.length };
   }
 
@@ -691,6 +722,40 @@ async function sendTextMessage(eid, to, message, jid = "") {
   }
 }
 
+async function requestHistoryFromCachedChats(eid, sock) {
+  const chats = await loadChatsCache(eid);
+  if (!chats.length) {
+    return { requested: 0, note: "sem_cache" };
+  }
+
+  let requested = 0;
+
+  for (const chat of chats.slice(0, 40)) {
+    const jid = String(chat.id || "");
+    if (!jid || shouldSkipJid(jid)) continue;
+
+    const wrapped = chat.messages?.[0];
+    const msg = wrapped?.message || wrapped;
+    if (!msg?.key?.id || !msg?.messageTimestamp) continue;
+
+    let tsMs = parseMessageTimestamp(msg);
+    if (tsMs <= 0) continue;
+    if (tsMs < 9999999999) tsMs *= 1000;
+
+    try {
+      await sock.fetchMessageHistory(50, msg.key, tsMs);
+      requested += 1;
+    } catch (err) {
+      console.error(`fetchHistory cache ${eid}/${jid}:`, err.message);
+    }
+  }
+
+  return {
+    requested,
+    note: requested > 0 ? "cache_ok" : "sem_ancora_cache",
+  };
+}
+
 async function requestHistoryForConversas(eid, sock) {
   const [rows] = await db.query(
     `SELECT c.numero, c.wa_jid
@@ -769,16 +834,23 @@ async function syncHistoryForEid(rawEid) {
     clients[eid]
   );
 
+  if (requested === 0 || note === "sem_conversas" || note === "sem_ancora") {
+    const cached = await requestHistoryFromCachedChats(eid, clients[eid]);
+    if (cached.requested > 0) {
+      return waiter;
+    }
+  }
+
   if (note === "sem_conversas") {
     finishHistorySync(
       eid,
-      "Nenhuma conversa salva ainda. O historico e importado automaticamente ao conectar — aguarde alguns minutos.",
+      "Historico inicial so vem na primeira conexao (QR novo). Se apagou conversas no Rapidex, desconecte e escaneie o QR de novo, ou aguarde mensagens novas.",
       true
     );
   } else if (note === "sem_ancora") {
     finishHistorySync(
       eid,
-      "Aguardando importacao automatica do historico. Se acabou de conectar, aguarde 1–2 minutos e tente novamente.",
+      "Nao foi possivel ancorar o historico. Desconecte, escaneie o QR novamente e aguarde 1–2 minutos.",
       true
     );
   } else if (requested === 0) {
@@ -810,7 +882,7 @@ async function startClient(rawEid) {
       version,
       auth: state,
       printQRInTerminal: false,
-      browser: ["Rapidex", "Chrome", "120.0"],
+      browser: Browsers.macOS("Desktop"),
       syncFullHistory: SYNC_FULL_HISTORY,
       markOnlineOnConnect: false,
     });
@@ -862,8 +934,11 @@ async function startClient(rawEid) {
       rememberLidPhone(eid, lid, pn);
     });
 
-    sock.ev.on("messaging-history.set", async ({ messages, contacts, isLatest, progress }) => {
+    sock.ev.on("messaging-history.set", async ({ chats, messages, contacts, isLatest, progress }) => {
       try {
+        if (chats?.length) {
+          await mergeChatsCache(eid, chats);
+        }
         if (contacts?.length) {
           await forwardContactsToRapidex(eid, contacts, sock);
         }
@@ -889,6 +964,14 @@ async function startClient(rawEid) {
       }
     });
 
+    sock.ev.on("chats.upsert", async (chats) => {
+      try {
+        if (chats?.length) await mergeChatsCache(eid, chats);
+      } catch (err) {
+        console.error(`chats.upsert ${eid}:`, err.message);
+      }
+    });
+
     sock.ev.on("contacts.upsert", async (contacts) => {
       try {
         if (!contacts?.length) return;
@@ -899,11 +982,21 @@ async function startClient(rawEid) {
     });
 
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
-      if (type !== "notify") return;
-
       try {
-        for (const msg of messages || []) {
-          await processLiveMessage(sock, eid, msg);
+        if (type === "notify") {
+          for (const msg of messages || []) {
+            await processLiveMessage(sock, eid, msg);
+          }
+          return;
+        }
+
+        if (type === "append") {
+          const batch = (messages || []).filter(
+            (msg) => msg?.message && msg.key?.remoteJid && !shouldSkipJid(msg.key.remoteJid)
+          );
+          if (batch.length) {
+            await forwardHistoryBatch(eid, batch);
+          }
         }
       } catch (err) {
         console.error(`messages.upsert ${eid}:`, err.message);
@@ -936,7 +1029,7 @@ async function restoreSessions() {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.1" });
+  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.2" });
 });
 
 app.get("/status", async (req, res) => {
@@ -1130,11 +1223,12 @@ process.on("SIGTERM", () => {
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.2.1 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.2.2 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
+  console.log(`historyWebhook=${HISTORY_WEBHOOK_URL}`);
   if (!WEBHOOK_TOKEN) {
     console.warn(
-      "WHATS_WEBHOOK_TOKEN ausente: bot/inbox do painel nao recebera mensagens."
+      "WHATS_WEBHOOK_TOKEN ausente: historico e mensagens NAO serao enviados ao Rapidex."
     );
   }
   if (API_TOKEN) {
