@@ -69,8 +69,44 @@ await fs.ensureDir(SESSION_DIR);
 const clients = Object.create(null);
 const sessionStatus = Object.create(null);
 const starting = new Set();
-const lidToPhone = new Map();
+const lidMaps = Object.create(null);
 const activeHistorySync = Object.create(null);
+
+function getLidMap(eid) {
+  if (!lidMaps[eid]) {
+    lidMaps[eid] = new Map();
+  }
+  return lidMaps[eid];
+}
+
+async function loadLidMap(eid) {
+  const file = `${sessionPath(eid)}/lid-map.json`;
+  try {
+    const data = await fs.readJson(file);
+    const map = getLidMap(eid);
+    for (const [lid, phone] of Object.entries(data || {})) {
+      if (lid && phone) {
+        map.set(lid, String(phone));
+      }
+    }
+  } catch {
+    /* first run */
+  }
+}
+
+async function saveLidMap(eid) {
+  const map = getLidMap(eid);
+  const data = Object.fromEntries(map.entries());
+  await fs.writeJson(`${sessionPath(eid)}/lid-map.json`, data).catch(() => {});
+}
+
+function rememberLidPhone(eid, lid, phone) {
+  const lidJid = String(lid || "");
+  const normalized = normalizePhone(phone);
+  if (!lidJid || !normalized) return;
+  getLidMap(eid).set(lidJid, normalized);
+  saveLidMap(eid).catch(() => {});
+}
 
 function requireApiAuth(req, res, next) {
   if (!API_TOKEN || req.path === "/health") {
@@ -172,10 +208,26 @@ async function clearSession(eid) {
   await upsertSession(eid, { status: "disconnected", last_qr: null });
 }
 
+function isValidPhoneDigits(digits) {
+  const d = String(digits || "").replace(/\D/g, "");
+  if (d.length < 10 || d.length > 13) {
+    return false;
+  }
+  return true;
+}
+
 function normalizePhone(raw) {
-  const digits = String(raw || "").replace(/\D/g, "");
-  if (!digits) return "";
-  return digits.startsWith("55") ? digits : `55${digits}`;
+  let digits = String(raw || "").replace(/\D/g, "");
+  if (!isValidPhoneDigits(digits)) {
+    return "";
+  }
+  if (digits.length >= 10 && digits.length <= 11 && !digits.startsWith("55")) {
+    digits = `55${digits}`;
+  }
+  if (!isValidPhoneDigits(digits)) {
+    return "";
+  }
+  return digits;
 }
 
 function shouldSkipJid(jid) {
@@ -228,51 +280,45 @@ function messagePlaceholder(msg) {
   return "";
 }
 
-function resolveContact(msg) {
+function resolveContact(msg, eid = "") {
   const remoteJid = String(msg.key?.remoteJid || "");
   const altJid = String(msg.key?.remoteJidAlt || msg.key?.participant || "");
-
-  if (remoteJid.endsWith("@s.whatsapp.net")) {
-    return {
-      jid: remoteJid,
-      phone: remoteJid.split("@")[0].replace(/\D/g, ""),
-    };
-  }
+  const map = eid ? getLidMap(eid) : new Map();
 
   if (altJid.endsWith("@s.whatsapp.net")) {
-    return {
-      jid: remoteJid,
-      phone: altJid.split("@")[0].replace(/\D/g, ""),
-    };
-  }
-
-  if (remoteJid.endsWith("@lid")) {
-    const mapped = lidToPhone.get(remoteJid);
-    if (mapped) {
-      return { jid: remoteJid, phone: mapped.replace(/\D/g, "") };
+    const phone = normalizePhone(altJid.split("@")[0]);
+    if (phone) {
+      return { jid: remoteJid || altJid, phone };
     }
   }
 
-  if (altJid.endsWith("@lid")) {
-    const mapped = lidToPhone.get(altJid);
-    if (mapped) {
-      return { jid: remoteJid, phone: mapped.replace(/\D/g, "") };
+  if (remoteJid.endsWith("@s.whatsapp.net")) {
+    const phone = normalizePhone(remoteJid.split("@")[0]);
+    if (phone) {
+      return { jid: remoteJid, phone };
     }
   }
 
-  const fallback = remoteJid.split("@")[0].replace(/\D/g, "");
-  return {
-    jid: remoteJid,
-    phone: fallback.length >= 10 ? fallback : "",
-  };
+  for (const jid of [remoteJid, altJid]) {
+    if (!jid.endsWith("@lid")) continue;
+    const mapped = map.get(jid);
+    if (mapped) {
+      const phone = normalizePhone(mapped);
+      if (phone) {
+        return { jid: remoteJid || jid, phone };
+      }
+    }
+  }
+
+  return { jid: remoteJid, phone: "" };
 }
 
-function messageToPayload(msg) {
+function messageToPayload(msg, eid = "") {
   if (!msg?.message || !msg.key?.remoteJid || shouldSkipJid(msg.key.remoteJid)) {
     return null;
   }
 
-  const contact = resolveContact(msg);
+  const contact = resolveContact(msg, eid);
   const texto = messagePlaceholder(msg);
   if (!contact.phone || !texto) return null;
 
@@ -285,6 +331,111 @@ function messageToPayload(msg) {
     msgId: String(msg.key.id || ""),
     timestamp: parseMessageTimestamp(msg),
   };
+}
+
+function contactDisplayName(contact) {
+  return String(
+    contact?.name || contact?.notify || contact?.verifiedName || ""
+  ).trim();
+}
+
+function contactPhoneFromBaileys(contact, eid = "") {
+  const map = eid ? getLidMap(eid) : new Map();
+  const pn = String(contact?.phoneNumber || "");
+  if (pn.includes("@s.whatsapp.net")) {
+    return normalizePhone(pn.split("@")[0]);
+  }
+  if (pn) {
+    return normalizePhone(pn);
+  }
+
+  const id = String(contact?.id || "");
+  if (id.endsWith("@s.whatsapp.net")) {
+    return normalizePhone(id.split("@")[0]);
+  }
+  if (id.endsWith("@lid")) {
+    const mapped = map.get(id);
+    if (mapped) {
+      return normalizePhone(mapped);
+    }
+  }
+
+  return "";
+}
+
+function contactPhotoFromBaileys(contact) {
+  const img = String(contact?.imgUrl || "");
+  if (img.startsWith("http://") || img.startsWith("https://")) {
+    return img;
+  }
+  return "";
+}
+
+function contactsToPayload(contacts, eid = "") {
+  const out = [];
+  const seen = new Set();
+
+  for (const contact of contacts || []) {
+    const phone = contactPhoneFromBaileys(contact, eid);
+    const name = contactDisplayName(contact);
+    const jid = String(contact?.id || "");
+    const photo = contactPhotoFromBaileys(contact);
+    if (!phone || seen.has(phone)) continue;
+    seen.add(phone);
+    out.push({
+      phone,
+      name,
+      jid,
+      photo,
+    });
+  }
+
+  return out;
+}
+
+async function forwardContactsToRapidex(eid, contacts, sock = null) {
+  let payload = contactsToPayload(contacts, eid);
+
+  if (sock && payload.length) {
+    const enriched = [];
+    for (const row of payload) {
+      let photo = row.photo || "";
+      if (!photo && row.jid) {
+        try {
+          photo = (await sock.profilePictureUrl(row.jid, "image")) || "";
+        } catch {
+          photo = "";
+        }
+      }
+      enriched.push({ ...row, photo });
+    }
+    payload = enriched;
+  }
+
+  if (!WEBHOOK_TOKEN || !payload.length) {
+    return { updated: 0 };
+  }
+
+  try {
+    const res = await fetch(HISTORY_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: WEBHOOK_TOKEN,
+        eid: Number(eid),
+        contacts: payload,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error(`contacts webhook ${eid}: HTTP ${res.status}`);
+      return { updated: 0 };
+    }
+    return { updated: Number(data.names_updated || data.updated || 0) };
+  } catch (err) {
+    console.error(`contacts webhook ${eid}:`, err.message);
+    return { updated: 0 };
+  }
 }
 
 async function forwardToRapidex(
@@ -384,7 +535,7 @@ async function forwardHistoryBatch(eid, messages) {
   }
 
   const payloads = messages
-    .map((msg) => messageToPayload(msg))
+    .map((msg) => messageToPayload(msg, eid))
     .filter(Boolean);
 
   if (!payloads.length) {
@@ -446,7 +597,7 @@ async function processLiveMessage(sock, eid, msg) {
     return;
   }
 
-  const contact = resolveContact(msg);
+  const contact = resolveContact(msg, eid);
   const numero = contact.phone;
   const waJid = contact.jid;
   if (!numero || !waJid) return;
@@ -455,7 +606,7 @@ async function processLiveMessage(sock, eid, msg) {
   if (!texto) return;
 
   const fromMe = !!msg.key.fromMe;
-  const pushName = msg.pushName || "";
+  const pushName = msg.pushName || msg.verifiedBizName || "";
   const msgId = String(msg.key.id || "");
 
   forwardToRapidex(eid, numero, texto, fromMe, pushName, waJid, msgId).catch(
@@ -649,6 +800,7 @@ async function startClient(rawEid) {
   try {
     const authPath = sessionPath(eid);
     await fs.ensureDir(authPath);
+    await loadLidMap(eid);
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -707,15 +859,15 @@ async function startClient(rawEid) {
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("lid-mapping.update", ({ lid, pn }) => {
-      const lidJid = String(lid || "");
-      const phone = normalizePhone(pn);
-      if (lidJid && phone) {
-        lidToPhone.set(lidJid, phone);
-      }
+      rememberLidPhone(eid, lid, pn);
     });
 
-    sock.ev.on("messaging-history.set", async ({ messages, isLatest, progress }) => {
+    sock.ev.on("messaging-history.set", async ({ messages, contacts, isLatest, progress }) => {
       try {
+        if (contacts?.length) {
+          await forwardContactsToRapidex(eid, contacts, sock);
+        }
+
         const batch = (messages || []).filter(
           (msg) => msg?.message && msg.key?.remoteJid && !shouldSkipJid(msg.key.remoteJid)
         );
@@ -734,6 +886,15 @@ async function startClient(rawEid) {
         }
       } catch (err) {
         console.error(`messaging-history.set ${eid}:`, err.message);
+      }
+    });
+
+    sock.ev.on("contacts.upsert", async (contacts) => {
+      try {
+        if (!contacts?.length) return;
+        await forwardContactsToRapidex(eid, contacts, sock);
+      } catch (err) {
+        console.error(`contacts.upsert ${eid}:`, err.message);
       }
     });
 
@@ -775,7 +936,7 @@ async function restoreSessions() {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.0" });
+  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.1" });
 });
 
 app.get("/status", async (req, res) => {
@@ -915,6 +1076,24 @@ app.post("/disconnect", async (req, res) => {
   }
 });
 
+app.get("/avatar", async (req, res) => {
+  const eid = String(req.query.eid || "").trim();
+  const jid = String(req.query.jid || "").trim();
+  if (!eid || !jid || !clients[eid]) {
+    return res.status(404).end();
+  }
+
+  try {
+    const url = await clients[eid].profilePictureUrl(jid, "image");
+    if (!url) {
+      return res.status(404).end();
+    }
+    return res.redirect(302, url);
+  } catch {
+    return res.status(404).end();
+  }
+});
+
 /** @deprecated Preferir fila PHP + cron Rapidex */
 app.post("/queue", async (req, res) => {
   const eid = Number(req.body?.eid || 0);
@@ -938,9 +1117,20 @@ app.post("/queue", async (req, res) => {
 await ensureSessionTable();
 await restoreSessions();
 
+if (process.env.RAILWAY_ENVIRONMENT && SESSION_DIR === "./sessions") {
+  console.warn(
+    "AVISO: monte um Volume no Railway em /app/sessions e defina SESSION_DIR=/app/sessions — senao cada deploy desconecta o WhatsApp."
+  );
+}
+
+process.on("SIGTERM", () => {
+  console.log("SIGTERM recebido — encerrando sem logout (sessao preservada no disco).");
+  process.exit(0);
+});
+
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.2.0 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.2.1 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   if (!WEBHOOK_TOKEN) {
     console.warn(
