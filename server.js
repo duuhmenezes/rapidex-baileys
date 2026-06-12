@@ -9,6 +9,9 @@ import makeWASocket, {
   Browsers,
 } from "@whiskeysockets/baileys";
 import mysql from "mysql2/promise";
+import { patchBaileysHistory } from "./scripts/patch-baileys-history.mjs";
+
+patchBaileysHistory();
 
 const SESSION_DIR = process.env.SESSION_DIR || "./sessions";
 const WEBHOOK_URL =
@@ -174,6 +177,65 @@ function ingestLidFromMessages(eid, chats = [], messages = []) {
       }
     }
   }
+}
+
+async function syncLidMappingsToSignalStore(sock, contacts = [], chats = []) {
+  const store = sock?.signalRepository?.lidMapping?.storeLIDPNMappings;
+  if (!store) return 0;
+
+  const pairs = [];
+  const seen = new Set();
+  const addPair = (lidRaw, pnRaw) => {
+    const lid = String(lidRaw || "").trim();
+    const pn = String(pnRaw || "").trim();
+    if (!lid.endsWith("@lid") || !isPnJid(pn)) return;
+    const key = `${lid}|${pn}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    pairs.push({ lid, pn });
+  };
+
+  for (const contact of contacts) {
+    addPair(
+      contact?.lid ||
+        contact?.lidJid ||
+        (String(contact?.id || "").endsWith("@lid") ? contact.id : ""),
+      contact?.phoneNumber || contact?.pnJid
+    );
+  }
+
+  for (const chat of chats) {
+    addPair(chat?.lidJid, chat?.pnJid);
+    if (String(chat?.id || "").endsWith("@lid")) {
+      addPair(chat.id, chat?.pnJid);
+    }
+  }
+
+  if (!pairs.length) return 0;
+  await store(pairs);
+  return pairs.length;
+}
+
+function logHistoryDebug(eid, chats, contacts, messages) {
+  const sampleMsgs = (messages || []).slice(0, 2).map((m) => ({
+    remoteJid: m?.key?.remoteJid,
+    remoteJidAlt: m?.key?.remoteJidAlt,
+    participantAlt: m?.key?.participantAlt,
+    fromMe: m?.key?.fromMe,
+  }));
+  const sampleChats = (chats || []).slice(0, 2).map((c) => ({
+    id: c?.id,
+    pnJid: c?.pnJid,
+    lidJid: c?.lidJid,
+  }));
+  const sampleContacts = (contacts || []).slice(0, 2).map((c) => ({
+    id: c?.id,
+    phoneNumber: c?.phoneNumber,
+    lid: c?.lid,
+  }));
+  console.warn(
+    `history ${eid}: debug samples msgs=${JSON.stringify(sampleMsgs)} chats=${JSON.stringify(sampleChats)} contacts=${JSON.stringify(sampleContacts)}`
+  );
 }
 
 function chatsCacheFile(eid) {
@@ -691,6 +753,7 @@ async function forwardHistoryBatch(eid, messages, sock = null) {
     console.warn(
       `history ${eid}: ${messages.length} msgs recebidas mas 0 com telefone valido (LID sem mapa?)`
     );
+    logHistoryDebug(eid, [], [], messages);
     return { imported: 0, skipped: messages.length };
   }
 
@@ -1067,10 +1130,15 @@ async function startClient(rawEid) {
 
         ingestLidMappings(eid, contacts, chats);
         ingestLidFromMessages(eid, chats, messages);
+        const signalPairs = await syncLidMappingsToSignalStore(sock, contacts, chats);
         await saveLidMap(eid);
+        const mapSize = getLidMap(eid).size;
         console.log(
-          `history ${eid}: lid-map ${getLidMap(eid).size} entradas antes de importar msgs`
+          `history ${eid}: lid-map ${mapSize} entradas, signal ${signalPairs} pares (antes de importar msgs)`
         );
+        if (mapSize === 0 && signalPairs === 0) {
+          logHistoryDebug(eid, chats, contacts, messages);
+        }
 
         if (contacts?.length) {
           await forwardContactsToRapidex(eid, contacts, sock);
@@ -1178,7 +1246,7 @@ async function restoreSessions() {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.4" });
+  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.5" });
 });
 
 app.get("/status", async (req, res) => {
@@ -1372,7 +1440,7 @@ process.on("SIGTERM", () => {
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.2.4 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.2.5 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   console.log(`historyWebhook=${HISTORY_WEBHOOK_URL}`);
   if (!WEBHOOK_TOKEN) {
