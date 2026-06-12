@@ -760,6 +760,9 @@ async function resolveMessageContact(msg, eid = "", sock = null) {
   if (!phone && isLidJid(remoteJid)) {
     phone = lidUserFromJid(remoteJid);
     jid = remoteJid;
+    console.warn(
+      `[${eid || "?"}] resolveMessageContact: somente LID disponível (${remoteJid}), PN não resolvido`
+    );
   }
 
   return { phone, jid, remoteJid };
