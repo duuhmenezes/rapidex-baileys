@@ -1330,6 +1330,55 @@ async function maybeForwardToGroup(sock, eid, remoteJid, msg, numero, texto) {
   }
 }
 
+async function resolveSendTarget(sock, eid, to, jid = "") {
+  const targetJid = String(jid || "").trim();
+  const lidMap = eid ? getLidMap(String(eid)) : new Map();
+
+  if (targetJid.includes("@")) {
+    if (targetJid.endsWith("@lid")) {
+      const cached = lidMap.get(targetJid);
+      if (cached) {
+        const pn = cached.includes("@") ? cached : `${cached}@s.whatsapp.net`;
+        console.log(`send ${eid}: LID ${targetJid} -> PN cache ${pn}`);
+        return pn;
+      }
+      try {
+        const pnJid = await sock?.signalRepository?.lidMapping?.getPNForLID?.(targetJid);
+        if (pnJid && String(pnJid).includes("@")) {
+          const phone = phoneFromJid(pnJid);
+          if (phone) rememberLidPhone(String(eid), targetJid, phone);
+          console.log(`send ${eid}: LID ${targetJid} -> PN map ${pnJid}`);
+          return String(pnJid);
+        }
+      } catch (err) {
+        console.warn(`send ${eid}: getPNForLID ${targetJid}:`, err.message);
+      }
+    }
+    return targetJid;
+  }
+
+  const phone = normalizePhone(to);
+  if (!phone) return null;
+
+  for (const [lid, mappedPhone] of lidMap.entries()) {
+    if (mappedPhone === phone) {
+      console.log(`send ${eid}: phone ${phone} -> LID cache ${lid}`);
+      return lid;
+    }
+  }
+
+  try {
+    const [result] = await sock.onWhatsApp(phone);
+    if (result?.exists && result.jid) {
+      return result.jid;
+    }
+  } catch (err) {
+    console.warn(`send ${eid}: onWhatsApp ${phone}:`, err.message);
+  }
+
+  return `${phone}@s.whatsapp.net`;
+}
+
 async function sendTextMessage(eid, to, message, jid = "") {
   const key = String(eid);
   const status = await readStatus(key);
@@ -1345,24 +1394,14 @@ async function sendTextMessage(eid, to, message, jid = "") {
 
   try {
     const sock = clients[key];
-    const targetJid = String(jid || "").trim();
-
-    if (targetJid.includes("@")) {
-      await sock.sendMessage(targetJid, { text });
-      return { success: true };
-    }
-
-    const phone = normalizePhone(to);
-    if (!phone) {
+    const target = await resolveSendTarget(sock, key, to, jid);
+    if (!target) {
       return { success: false, error: "invalid_number" };
     }
 
-    const [result] = await sock.onWhatsApp(phone);
-    if (!result?.exists) {
-      return { success: false, error: "number_not_found" };
-    }
-    await sock.sendMessage(result.jid, { text });
-    return { success: true };
+    console.log(`send ${key}: -> ${target} "${text.slice(0, 60)}"`);
+    await sock.sendMessage(target, { text });
+    return { success: true, jid: target };
   } catch (err) {
     console.error(`send ${key}:`, err.message);
     return { success: false, error: err.message || "send_failed" };
@@ -1932,7 +1971,7 @@ process.on("SIGTERM", () => {
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.3.2 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.3.4 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   console.log(`historyWebhook=${HISTORY_WEBHOOK_URL}`);
   if (!WEBHOOK_TOKEN) {
