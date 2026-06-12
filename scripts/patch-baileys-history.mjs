@@ -22,6 +22,19 @@ const SNIPPET = `
             }
 `;
 
+const WRONG_SNIPPET_RE =
+  /\n            \/\/ rapidex-phoneNumberToLidMappings\n            for \(const map of item\.phoneNumberToLidMappings \|\| \[\]\) \{[\s\S]*?\n            \}\n/g;
+
+const END_ANCHOR = `                chats.push({ ...chat });
+            }
+            break;
+        case proto.HistorySync.HistorySyncType.PUSH_NAME:`;
+
+const END_REPLACEMENT = `                chats.push({ ...chat });
+            }${SNIPPET}
+            break;
+        case proto.HistorySync.HistorySyncType.PUSH_NAME:`;
+
 function resolveHistoryPaths() {
   const paths = [];
   const candidates = [
@@ -49,18 +62,23 @@ function resolveHistoryPaths() {
 
 function patchFile(historyPath) {
   let src = readFileSync(historyPath, "utf8");
-  if (src.includes(MARKER)) {
+  const wrongPlacement = WRONG_SNIPPET_RE.test(src);
+
+  if (src.includes(MARKER) && !wrongPlacement) {
     return "already";
   }
 
-  const anchor = "                chats.push({ ...chat });";
-  if (!src.includes(anchor)) {
+  if (wrongPlacement) {
+    src = src.replace(WRONG_SNIPPET_RE, "\n");
+  }
+
+  if (!src.includes(END_ANCHOR)) {
     return "no-anchor";
   }
 
-  src = src.replace(anchor, `${SNIPPET}\n                chats.push({ ...chat });`);
+  src = src.replace(END_ANCHOR, END_REPLACEMENT);
   writeFileSync(historyPath, src);
-  return "patched";
+  return wrongPlacement ? "relocated" : "patched";
 }
 
 export function patchBaileysHistory() {
@@ -75,8 +93,8 @@ export function patchBaileysHistory() {
   let ok = 0;
   for (const historyPath of paths) {
     const result = patchFile(historyPath);
-    if (result === "patched") {
-      console.log(`patch-baileys-history: aplicado em ${historyPath}`);
+    if (result === "patched" || result === "relocated") {
+      console.log(`patch-baileys-history: ${result} em ${historyPath}`);
       ok++;
     } else if (result === "already") {
       console.log(`patch-baileys-history: ja aplicado em ${historyPath}`);
@@ -89,8 +107,9 @@ export function patchBaileysHistory() {
   return ok > 0;
 }
 
-const isDirectRun = process.argv[1] &&
-  fileURLToPath(import.meta.url) === process.argv[1].replace(/\\/g, "/") ||
+const isDirectRun =
+  (process.argv[1] &&
+    fileURLToPath(import.meta.url) === process.argv[1].replace(/\\/g, "/")) ||
   process.argv[1]?.endsWith("patch-baileys-history.mjs");
 
 if (isDirectRun) {

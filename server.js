@@ -7,6 +7,8 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers,
+  USyncQuery,
+  USyncUser,
 } from "@whiskeysockets/baileys";
 import mysql from "mysql2/promise";
 import { patchBaileysHistory } from "./scripts/patch-baileys-history.mjs";
@@ -214,6 +216,116 @@ async function syncLidMappingsToSignalStore(sock, contacts = [], chats = []) {
   if (!pairs.length) return 0;
   await store(pairs);
   return pairs.length;
+}
+
+function collectLidJids(...sources) {
+  const lids = new Set();
+  const remember = (raw) => {
+    const jid = String(raw || "").trim();
+    if (jid.endsWith("@lid") || jid.endsWith("@hosted.lid")) {
+      lids.add(jid);
+    }
+  };
+
+  for (const list of sources) {
+    for (const item of list || []) {
+      remember(item?.key?.remoteJid);
+      remember(item?.key?.remoteJidAlt);
+      remember(item?.key?.participantAlt);
+      remember(item?.id);
+      remember(item?.lid);
+      remember(item?.lidJid);
+    }
+  }
+
+  return [...lids];
+}
+
+function unresolvedLidJids(eid, lidJids) {
+  const map = getLidMap(eid);
+  return lidJids.filter((lid) => !map.get(lid));
+}
+
+/** Resolve LID→PN via USync (mesmo fluxo do Baileys ao enviar mensagem). */
+async function resolveLidsViaUsync(sock, eid, lidJids) {
+  const pending = unresolvedLidJids(eid, lidJids);
+  if (!pending.length || !sock?.executeUSyncQuery) {
+    return 0;
+  }
+
+  let resolved = 0;
+  const batchSize = 15;
+
+  for (let i = 0; i < pending.length; i += batchSize) {
+    const batch = pending.slice(i, i + batchSize);
+    const query = new USyncQuery()
+      .withContext("background")
+      .withDeviceProtocol()
+      .withLIDProtocol();
+
+    for (const lid of batch) {
+      query.withUser(new USyncUser().withId(lid));
+    }
+
+    try {
+      const result = await sock.executeUSyncQuery(query);
+      const pairs = (result?.list || []).filter(
+        (row) => row?.lid && row?.id && isPnJid(row.id)
+      );
+
+      if (pairs.length && sock.signalRepository?.lidMapping?.storeLIDPNMappings) {
+        await sock.signalRepository.lidMapping.storeLIDPNMappings(
+          pairs.map((row) => ({ lid: row.lid, pn: row.id }))
+        );
+      }
+
+      for (const row of pairs) {
+        const phone = phoneFromJid(row.id);
+        if (phone) {
+          rememberLidPhone(eid, row.lid, phone);
+          resolved += 1;
+        }
+      }
+    } catch (err) {
+      console.warn(`resolveLidsViaUsync ${eid}:`, err.message);
+    }
+  }
+
+  if (resolved > 0) {
+    await saveLidMap(eid);
+  }
+
+  return resolved;
+}
+
+async function preflightHistoryLids(eid, sock, messages, chats, contacts) {
+  if (!sock) return 0;
+
+  const lids = collectLidJids(messages, chats, contacts);
+  const pending = unresolvedLidJids(eid, lids);
+  if (!pending.length) return 0;
+
+  let resolved = await resolveLidsViaUsync(sock, eid, pending);
+
+  for (const lid of pending) {
+    if (getLidMap(eid).get(lid)) continue;
+    try {
+      const pnJid = await sock.signalRepository?.lidMapping?.getPNForLID?.(lid);
+      const phone = phoneFromJid(pnJid);
+      if (phone) {
+        rememberLidPhone(eid, lid, phone);
+        resolved += 1;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (resolved > 0) {
+    await saveLidMap(eid);
+  }
+
+  return resolved;
 }
 
 function logHistoryDebug(eid, chats, contacts, messages) {
@@ -743,6 +855,8 @@ async function forwardHistoryBatch(eid, messages, sock = null) {
     return { imported: 0, skipped: 0 };
   }
 
+  await preflightHistoryLids(eid, sock, messages, [], []);
+
   const payloads = [];
   for (const msg of messages) {
     const row = await messageToPayloadAsync(msg, eid, sock);
@@ -1131,10 +1245,17 @@ async function startClient(rawEid) {
         ingestLidMappings(eid, contacts, chats);
         ingestLidFromMessages(eid, chats, messages);
         const signalPairs = await syncLidMappingsToSignalStore(sock, contacts, chats);
+        const usyncResolved = await preflightHistoryLids(
+          eid,
+          sock,
+          messages,
+          chats,
+          contacts
+        );
         await saveLidMap(eid);
         const mapSize = getLidMap(eid).size;
         console.log(
-          `history ${eid}: lid-map ${mapSize} entradas, signal ${signalPairs} pares (antes de importar msgs)`
+          `history ${eid}: lid-map ${mapSize} entradas, signal ${signalPairs} pares, usync ${usyncResolved} resolvidos`
         );
         if (mapSize === 0 && signalPairs === 0) {
           logHistoryDebug(eid, chats, contacts, messages);
@@ -1246,7 +1367,7 @@ async function restoreSessions() {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.6" });
+  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.7" });
 });
 
 app.get("/status", async (req, res) => {
@@ -1440,7 +1561,7 @@ process.on("SIGTERM", () => {
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.2.6 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.2.7 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   console.log(`historyWebhook=${HISTORY_WEBHOOK_URL}`);
   if (!WEBHOOK_TOKEN) {
