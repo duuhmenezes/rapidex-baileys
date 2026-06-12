@@ -22,18 +22,11 @@ const SNIPPET = `
             }
 `;
 
-const WRONG_SNIPPET_RE =
-  /\n            \/\/ rapidex-phoneNumberToLidMappings\n            for \(const map of item\.phoneNumberToLidMappings \|\| \[\]\) \{[\s\S]*?\n            \}\n/g;
+const SNIPPET_BLOCK_RE =
+  /\r?\n\s*\/\/ rapidex-phoneNumberToLidMappings\r?\n\s*for \(const map of item\.phoneNumberToLidMappings \|\| \[\]\) \{[\s\S]*?\r?\n\s*\}\r?\n/;
 
-const END_ANCHOR = `                chats.push({ ...chat });
-            }
-            break;
-        case proto.HistorySync.HistorySyncType.PUSH_NAME:`;
-
-const END_REPLACEMENT = `                chats.push({ ...chat });
-            }${SNIPPET}
-            break;
-        case proto.HistorySync.HistorySyncType.PUSH_NAME:`;
+const INSERT_RE =
+  /(chats\.push\(\{ \.\.\.chat \}\);\r?\n\s*\})\r?\n(\s*break;\r?\n\s*case proto\.HistorySync\.HistorySyncType\.PUSH_NAME:)/;
 
 function resolveHistoryPaths() {
   const paths = [];
@@ -62,23 +55,24 @@ function resolveHistoryPaths() {
 
 function patchFile(historyPath) {
   let src = readFileSync(historyPath, "utf8");
-  const wrongPlacement = WRONG_SNIPPET_RE.test(src);
+  const pushPos = src.indexOf("chats.push({ ...chat });");
 
-  if (src.includes(MARKER) && !wrongPlacement) {
-    return "already";
+  if (src.includes(MARKER)) {
+    const markerPos = src.indexOf(MARKER);
+    if (markerPos !== -1 && pushPos !== -1 && markerPos < pushPos) {
+      src = src.replace(SNIPPET_BLOCK_RE, "\n");
+    } else {
+      return "already";
+    }
   }
 
-  if (wrongPlacement) {
-    src = src.replace(WRONG_SNIPPET_RE, "\n");
-  }
-
-  if (!src.includes(END_ANCHOR)) {
+  if (!INSERT_RE.test(src)) {
     return "no-anchor";
   }
 
-  src = src.replace(END_ANCHOR, END_REPLACEMENT);
+  src = src.replace(INSERT_RE, `$1${SNIPPET}$2`);
   writeFileSync(historyPath, src);
-  return wrongPlacement ? "relocated" : "patched";
+  return "patched";
 }
 
 export function patchBaileysHistory() {
@@ -93,11 +87,11 @@ export function patchBaileysHistory() {
   let ok = 0;
   for (const historyPath of paths) {
     const result = patchFile(historyPath);
-    if (result === "patched" || result === "relocated") {
-      console.log(`patch-baileys-history: ${result} em ${historyPath}`);
+    if (result === "patched") {
+      console.log(`patch-baileys-history: aplicado em ${historyPath}`);
       ok++;
     } else if (result === "already") {
-      console.log(`patch-baileys-history: ja aplicado em ${historyPath}`);
+      console.log(`patch-baileys-history: ok em ${historyPath}`);
       ok++;
     } else {
       console.warn(`patch-baileys-history: anchor ausente em ${historyPath}`);

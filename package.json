@@ -1,6 +1,6 @@
 {
   "name": "rapidex-baileys",
-  "version": "2.2.7",
+  "version": "2.2.8",
   "description": "Servico WhatsApp (Baileys) para o Rapidex",
   "main": "server.js",
   "type": "module",
@@ -12,7 +12,7 @@
     "postinstall": "node scripts/patch-baileys-history.mjs"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0-rc.6",
+    "@whiskeysockets/baileys": "7.0.0-rc.6",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "fs-extra": "^11.2.0",

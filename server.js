@@ -1,3 +1,4 @@
+import "./preload.mjs";
 import express from "express";
 import qrcode from "qrcode";
 import fs from "fs-extra";
@@ -11,9 +12,6 @@ import makeWASocket, {
   USyncUser,
 } from "@whiskeysockets/baileys";
 import mysql from "mysql2/promise";
-import { patchBaileysHistory } from "./scripts/patch-baileys-history.mjs";
-
-patchBaileysHistory();
 
 const SESSION_DIR = process.env.SESSION_DIR || "./sessions";
 const WEBHOOK_URL =
@@ -77,6 +75,8 @@ const sessionStatus = Object.create(null);
 const starting = new Set();
 const lidMaps = Object.create(null);
 const activeHistorySync = Object.create(null);
+const historyReceived = Object.create(null);
+const historyBootstrapTimers = Object.create(null);
 
 function getLidMap(eid) {
   if (!lidMaps[eid]) {
@@ -793,6 +793,22 @@ async function forwardToRapidex(
   }
 }
 
+async function scheduleHistoryBootstrap(eid, sock) {
+  clearTimeout(historyBootstrapTimers[eid]);
+  historyBootstrapTimers[eid] = setTimeout(async () => {
+    delete historyBootstrapTimers[eid];
+    if (historyReceived[eid] || !clients[eid]) return;
+
+    console.log(
+      `history ${eid}: sync inicial nao veio (reconexao?) — tentando chats-cache...`
+    );
+    const cached = await requestHistoryFromCachedChats(eid, sock);
+    console.log(
+      `history ${eid}: bootstrap cache requested=${cached.requested} (${cached.note})`
+    );
+  }, 25000);
+}
+
 function finishHistorySync(eid, msg = "Historico sincronizado.", force = false) {
   const sync = activeHistorySync[eid];
   if (!sync) return null;
@@ -1206,9 +1222,11 @@ async function startClient(rawEid) {
       if (connection === "open") {
         console.log(`Loja ${eid} conectada`);
         sessionStatus[eid] = "connected";
+        historyReceived[eid] = false;
         await fs.writeFile(statusFile(eid), "connected");
         if (await fs.pathExists(qrFile(eid))) await fs.remove(qrFile(eid));
         await upsertSession(eid, { status: "connected", last_qr: null });
+        scheduleHistoryBootstrap(eid, sock);
       }
 
       if (connection === "close") {
@@ -1238,6 +1256,10 @@ async function startClient(rawEid) {
 
     sock.ev.on("messaging-history.set", async ({ chats, messages, contacts, isLatest, progress }) => {
       try {
+        historyReceived[eid] = true;
+        clearTimeout(historyBootstrapTimers[eid]);
+        delete historyBootstrapTimers[eid];
+
         if (chats?.length) {
           await mergeChatsCache(eid, chats);
         }
@@ -1367,7 +1389,7 @@ async function restoreSessions() {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.7" });
+  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.8" });
 });
 
 app.get("/status", async (req, res) => {
@@ -1561,7 +1583,7 @@ process.on("SIGTERM", () => {
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.2.7 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.2.8 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   console.log(`historyWebhook=${HISTORY_WEBHOOK_URL}`);
   if (!WEBHOOK_TOKEN) {
