@@ -1246,7 +1246,7 @@ async function restoreSessions() {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.5" });
+  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.6" });
 });
 
 app.get("/status", async (req, res) => {
@@ -1440,7 +1440,7 @@ process.on("SIGTERM", () => {
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.2.5 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.2.6 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   console.log(`historyWebhook=${HISTORY_WEBHOOK_URL}`);
   if (!WEBHOOK_TOKEN) {
