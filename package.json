@@ -1,6 +1,6 @@
 {
   "name": "rapidex-baileys",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "Servico WhatsApp (Baileys) para o Rapidex",
   "main": "server.js",
   "type": "module",

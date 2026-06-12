@@ -662,6 +662,13 @@ function phoneFromJid(jid) {
   return normalizePhone(user);
 }
 
+/** User part bruto de @lid (nao valida como telefone BR). */
+function lidUserFromJid(jid) {
+  const raw = String(jid || "").trim();
+  if (!isLidJid(raw)) return "";
+  return raw.split("@")[0].split(":")[0].replace(/\D/g, "");
+}
+
 function resolveContact(msg, eid = "") {
   const remoteJid = String(msg.key?.remoteJid || "");
   const altJid = String(
@@ -740,7 +747,7 @@ async function messageToPayloadAsync(msg, eid = "", sock = null) {
   const remoteJid = String(msg.key.remoteJid || "");
 
   if (!phone && isLidJid(remoteJid)) {
-    phone = phoneFromJid(remoteJid);
+    phone = lidUserFromJid(remoteJid);
     jid = remoteJid;
   }
 
@@ -991,8 +998,11 @@ async function forwardHistoryBatch(eid, messages, sock = null) {
   }
 
   if (!payloads.length) {
+    const sample = messages.slice(0, 1)[0];
+    const remoteJid = String(sample?.key?.remoteJid || "");
+    const texto = sample ? messagePlaceholder(sample) : "";
     console.warn(
-      `history ${eid}: ${messages.length} msgs recebidas mas 0 com telefone valido (LID sem mapa?)`
+      `history ${eid}: ${messages.length} msgs mas 0 payloads (jid=${remoteJid}, texto=${texto ? "ok" : "vazio"}, lidUser=${lidUserFromJid(remoteJid) || "?"})`
     );
     logHistoryDebug(eid, [], [], messages);
     return { imported: 0, skipped: messages.length };
@@ -1519,7 +1529,7 @@ async function restoreSessions() {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.9" });
+  res.json({ ok: true, service: "rapidex-baileys", version: "2.3.1" });
 });
 
 app.get("/status", async (req, res) => {
@@ -1713,7 +1723,7 @@ process.on("SIGTERM", () => {
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.2.9 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.3.0 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   console.log(`historyWebhook=${HISTORY_WEBHOOK_URL}`);
   if (!WEBHOOK_TOKEN) {
