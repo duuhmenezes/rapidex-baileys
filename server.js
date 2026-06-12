@@ -246,6 +246,113 @@ function unresolvedLidJids(eid, lidJids) {
   return lidJids.filter((lid) => !map.get(lid));
 }
 
+function normalizeLidJid(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  if (value.includes("@")) return value;
+  return `${value}@lid`;
+}
+
+function isLidJid(jid) {
+  const j = String(jid || "");
+  return j.endsWith("@lid") || j.endsWith("@hosted.lid");
+}
+
+/** Extrai pares LID↔PN do retorno USync (id pode ser LID ou PN). */
+function extractLidPnPairsFromUsync(rows) {
+  const pairs = [];
+  const seen = new Set();
+
+  for (const row of rows || []) {
+    const id = String(row?.id || "").trim();
+    const lidField = String(row?.lid || "").trim();
+    let lid = "";
+    let pn = "";
+
+    if (isLidJid(id)) {
+      lid = id;
+      if (isPnJid(lidField)) {
+        pn = lidField;
+      } else if (/^\d+$/.test(lidField)) {
+        pn = `${lidField}@s.whatsapp.net`;
+      }
+    } else if (isPnJid(id) && lidField) {
+      pn = id;
+      lid = normalizeLidJid(lidField);
+    }
+
+    if (!lid || !pn || !isPnJid(pn)) continue;
+    const key = `${lid}|${pn}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pairs.push({ lid, pn });
+  }
+
+  return pairs;
+}
+
+async function storeLidPnPairs(sock, eid, pairs) {
+  if (!pairs.length) return 0;
+
+  if (sock?.signalRepository?.lidMapping?.storeLIDPNMappings) {
+    await sock.signalRepository.lidMapping.storeLIDPNMappings(pairs);
+  }
+
+  let stored = 0;
+  for (const { lid, pn } of pairs) {
+    const phone = phoneFromJid(pn);
+    if (phone) {
+      rememberLidPhone(eid, lid, phone);
+      stored += 1;
+    }
+  }
+  return stored;
+}
+
+async function usyncQueryLidPairs(sock, lids, mode = "message") {
+  if (!sock?.executeUSyncQuery || !lids.length) return [];
+
+  const strategies = [
+    () => {
+      const query = new USyncQuery()
+        .withContext(mode)
+        .withDeviceProtocol()
+        .withLIDProtocol();
+      for (const lid of lids) {
+        query.withUser(new USyncUser().withId(lid).withLid(lid));
+      }
+      return query;
+    },
+    () => {
+      const query = new USyncQuery().withContext("interactive").withLIDProtocol();
+      for (const lid of lids) {
+        query.withUser(new USyncUser().withId(lid).withLid(lid));
+      }
+      return query;
+    },
+  ];
+
+  const allPairs = [];
+  const seen = new Set();
+
+  for (const build of strategies) {
+    try {
+      const result = await sock.executeUSyncQuery(build());
+      for (const pair of extractLidPnPairsFromUsync(result?.list || [])) {
+        const key = `${pair.lid}|${pair.pn}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        allPairs.push(pair);
+      }
+      if (allPairs.length) break;
+    } catch {
+      /* tenta proxima estrategia */
+    }
+  }
+
+  return allPairs;
+}
+
 /** Resolve LID→PN via USync (mesmo fluxo do Baileys ao enviar mensagem). */
 async function resolveLidsViaUsync(sock, eid, lidJids) {
   const pending = unresolvedLidJids(eid, lidJids);
@@ -254,41 +361,19 @@ async function resolveLidsViaUsync(sock, eid, lidJids) {
   }
 
   let resolved = 0;
-  const batchSize = 15;
+  const batchSize = 10;
 
   for (let i = 0; i < pending.length; i += batchSize) {
     const batch = pending.slice(i, i + batchSize);
-    const query = new USyncQuery()
-      .withContext("background")
-      .withDeviceProtocol()
-      .withLIDProtocol();
-
-    for (const lid of batch) {
-      query.withUser(new USyncUser().withId(lid));
-    }
-
-    try {
-      const result = await sock.executeUSyncQuery(query);
-      const pairs = (result?.list || []).filter(
-        (row) => row?.lid && row?.id && isPnJid(row.id)
+    const pairs = await usyncQueryLidPairs(sock, batch, "message");
+    if (!pairs.length) {
+      console.warn(
+        `resolveLidsViaUsync ${eid}: 0 pares para LIDs ${batch.slice(0, 2).join(", ")}`
       );
-
-      if (pairs.length && sock.signalRepository?.lidMapping?.storeLIDPNMappings) {
-        await sock.signalRepository.lidMapping.storeLIDPNMappings(
-          pairs.map((row) => ({ lid: row.lid, pn: row.id }))
-        );
-      }
-
-      for (const row of pairs) {
-        const phone = phoneFromJid(row.id);
-        if (phone) {
-          rememberLidPhone(eid, row.lid, phone);
-          resolved += 1;
-        }
-      }
-    } catch (err) {
-      console.warn(`resolveLidsViaUsync ${eid}:`, err.message);
+      continue;
     }
+
+    resolved += await storeLidPnPairs(sock, eid, pairs);
   }
 
   if (resolved > 0) {
@@ -633,11 +718,22 @@ async function messageToPayloadAsync(msg, eid = "", sock = null) {
 
   const contact = await resolveContactAsync(msg, eid, sock);
   const texto = messagePlaceholder(msg);
-  if (!contact.phone || !texto) return null;
+  if (!texto) return null;
+
+  let phone = contact.phone;
+  let jid = String(contact.jid || msg.key.remoteJid || "");
+  const remoteJid = String(msg.key.remoteJid || "");
+
+  if (!phone && isLidJid(remoteJid)) {
+    phone = phoneFromJid(remoteJid);
+    jid = remoteJid;
+  }
+
+  if (!phone) return null;
 
   return {
-    from: contact.phone,
-    jid: contact.jid,
+    from: phone,
+    jid,
     message: texto,
     fromMe: !!msg.key.fromMe,
     pushName: msg.pushName || msg.verifiedBizName || "",
@@ -1389,7 +1485,7 @@ async function restoreSessions() {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.8" });
+  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.9" });
 });
 
 app.get("/status", async (req, res) => {
@@ -1583,7 +1679,7 @@ process.on("SIGTERM", () => {
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.2.8 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.2.9 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   console.log(`historyWebhook=${HISTORY_WEBHOOK_URL}`);
   if (!WEBHOOK_TOKEN) {
