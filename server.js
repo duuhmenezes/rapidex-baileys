@@ -100,6 +100,42 @@ async function loadLidMap(eid) {
   }
 }
 
+/** Bootstrap lid-map a partir dos arquivos lid-mapping-*_reverse do auth Baileys. */
+async function bootstrapLidMapFromAuthFiles(eid) {
+  const dir = sessionPath(eid);
+  let entries = [];
+  try {
+    entries = await fs.readdir(dir);
+  } catch {
+    return 0;
+  }
+
+  let loaded = 0;
+  for (const file of entries) {
+    const match = file.match(/^lid-mapping-(\d+)_reverse\.json$/);
+    if (!match) continue;
+    const lidUser = match[1];
+    try {
+      const pnUser = String(await fs.readJson(`${dir}/${file}`) ?? "").trim();
+      if (!pnUser) continue;
+      const lidJid = `${lidUser}@lid`;
+      const phone = normalizePhone(pnUser);
+      if (!phone || getLidMap(eid).get(lidJid)) continue;
+      rememberLidPhone(eid, lidJid, phone);
+      loaded += 1;
+    } catch {
+      /* ignore corrupt file */
+    }
+  }
+
+  if (loaded > 0) {
+    await saveLidMap(eid);
+    console.log(`lid-map ${eid}: ${loaded} pares carregados do auth-state`);
+  }
+
+  return loaded;
+}
+
 async function saveLidMap(eid) {
   const map = getLidMap(eid);
   const data = Object.fromEntries(map.entries());
@@ -258,37 +294,71 @@ function isLidJid(jid) {
   return j.endsWith("@lid") || j.endsWith("@hosted.lid");
 }
 
+function normalizePnJid(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  if (isPnJid(value)) return value;
+  if (/^\d+$/.test(value)) return `${value}@s.whatsapp.net`;
+  return "";
+}
+
+/** Extrai par LID↔PN de uma linha USync (mesma logica do Baileys messages-send). */
+function pairFromUsyncRow(row) {
+  const id = String(row?.id || "").trim();
+  const lidField = String(row?.lid || "").trim();
+  if (!id && !lidField) return null;
+
+  const candidates = [];
+  if (lidField) {
+    candidates.push({ lid: lidField, pn: id });
+    candidates.push({ lid: id, pn: lidField });
+  } else if (isLidJid(id)) {
+    return null;
+  }
+
+  for (const { lid: lidRaw, pn: pnRaw } of candidates) {
+    const lid = isLidJid(lidRaw)
+      ? lidRaw
+      : isLidJid(pnRaw)
+        ? pnRaw
+        : normalizeLidJid(lidRaw);
+    const pn = normalizePnJid(isPnJid(pnRaw) ? pnRaw : isPnJid(lidRaw) ? lidRaw : pnRaw);
+    if (lid && pn && isLidJid(lid) && isPnJid(pn)) {
+      return { lid, pn };
+    }
+  }
+
+  return null;
+}
+
 /** Extrai pares LID↔PN do retorno USync (id pode ser LID ou PN). */
 function extractLidPnPairsFromUsync(rows) {
   const pairs = [];
   const seen = new Set();
 
   for (const row of rows || []) {
-    const id = String(row?.id || "").trim();
-    const lidField = String(row?.lid || "").trim();
-    let lid = "";
-    let pn = "";
-
-    if (isLidJid(id)) {
-      lid = id;
-      if (isPnJid(lidField)) {
-        pn = lidField;
-      } else if (/^\d+$/.test(lidField)) {
-        pn = `${lidField}@s.whatsapp.net`;
-      }
-    } else if (isPnJid(id) && lidField) {
-      pn = id;
-      lid = normalizeLidJid(lidField);
-    }
-
-    if (!lid || !pn || !isPnJid(pn)) continue;
-    const key = `${lid}|${pn}`;
+    const pair = pairFromUsyncRow(row);
+    if (!pair) continue;
+    const key = `${pair.lid}|${pair.pn}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    pairs.push({ lid, pn });
+    pairs.push(pair);
   }
 
   return pairs;
+}
+
+function summarizeUsyncRows(rows) {
+  return (rows || []).slice(0, 4).map((row) => ({
+    id: row?.id,
+    lid: row?.lid,
+    devices: Array.isArray(row?.devices?.deviceList)
+      ? row.devices.deviceList.length
+      : row?.devices
+        ? 1
+        : 0,
+    contact: row?.contact ? 1 : 0,
+  }));
 }
 
 async function storeLidPnPairs(sock, eid, pairs) {
@@ -309,48 +379,127 @@ async function storeLidPnPairs(sock, eid, pairs) {
   return stored;
 }
 
-async function usyncQueryLidPairs(sock, lids, mode = "message") {
-  if (!sock?.executeUSyncQuery || !lids.length) return [];
+async function usyncQueryLidPairs(sock, lids, eid = "", mode = "message") {
+  if (!sock?.executeUSyncQuery || !lids.length) return { pairs: [], debug: [] };
 
   const strategies = [
-    () => {
-      const query = new USyncQuery()
-        .withContext(mode)
-        .withDeviceProtocol()
-        .withLIDProtocol();
-      for (const lid of lids) {
-        query.withUser(new USyncUser().withId(lid).withLid(lid));
-      }
-      return query;
+    {
+      label: "device+lid/by-id",
+      build: () => {
+        const query = new USyncQuery()
+          .withContext(mode)
+          .withDeviceProtocol()
+          .withLIDProtocol();
+        for (const lid of lids) {
+          query.withUser(new USyncUser().withId(lid));
+        }
+        return query;
+      },
     },
-    () => {
-      const query = new USyncQuery().withContext("interactive").withLIDProtocol();
-      for (const lid of lids) {
-        query.withUser(new USyncUser().withId(lid).withLid(lid));
-      }
-      return query;
+    {
+      label: "lid-inline/message",
+      build: () => {
+        const query = new USyncQuery().withContext(mode).withLIDProtocol();
+        for (const lid of lids) {
+          query.withUser(new USyncUser().withId(lid).withLid(lid));
+        }
+        return query;
+      },
+    },
+    {
+      label: "lid-inline/background",
+      build: () => {
+        const query = new USyncQuery().withContext("background").withLIDProtocol();
+        for (const lid of lids) {
+          query.withUser(new USyncUser().withId(lid).withLid(lid));
+        }
+        return query;
+      },
+    },
+    {
+      label: "lid-inline/interactive",
+      build: () => {
+        const query = new USyncQuery().withContext("interactive").withLIDProtocol();
+        for (const lid of lids) {
+          query.withUser(new USyncUser().withId(lid).withLid(lid));
+        }
+        return query;
+      },
     },
   ];
 
   const allPairs = [];
   const seen = new Set();
+  const debug = [];
 
-  for (const build of strategies) {
+  for (const { label, build } of strategies) {
     try {
       const result = await sock.executeUSyncQuery(build());
-      for (const pair of extractLidPnPairsFromUsync(result?.list || [])) {
+      const rows = result?.list || [];
+      const pairs = extractLidPnPairsFromUsync(rows);
+      debug.push({
+        strategy: label,
+        rows: rows.length,
+        pairs: pairs.length,
+        sample: summarizeUsyncRows(rows),
+      });
+
+      for (const pair of pairs) {
         const key = `${pair.lid}|${pair.pn}`;
         if (seen.has(key)) continue;
         seen.add(key);
         allPairs.push(pair);
       }
       if (allPairs.length) break;
-    } catch {
-      /* tenta proxima estrategia */
+    } catch (err) {
+      debug.push({ strategy: label, error: err?.message || String(err) });
     }
   }
 
-  return allPairs;
+  if (!allPairs.length && eid) {
+    console.warn(
+      `usyncQueryLidPairs ${eid}: 0 pares para ${lids.slice(0, 2).join(", ")} | ${JSON.stringify(debug)}`
+    );
+  }
+
+  return { pairs: allPairs, debug };
+}
+
+/** Resolve LIDs a partir de chats-cache (pnJid) e signal store local. */
+async function resolveLidsFromLocalSources(eid, sock, lidJids) {
+  let resolved = 0;
+  const pending = unresolvedLidJids(eid, lidJids);
+  if (!pending.length) return 0;
+
+  const chats = await loadChatsCache(eid);
+  const chatById = new Map(
+    chats.map((chat) => [String(chat?.id || ""), chat])
+  );
+
+  for (const lid of pending) {
+    if (getLidMap(eid).get(lid)) continue;
+
+    const chat = chatById.get(lid);
+    const pnFromChat = phoneFromJid(String(chat?.pnJid || ""));
+    if (pnFromChat) {
+      rememberLidPhone(eid, lid, pnFromChat);
+      resolved += 1;
+      continue;
+    }
+
+    try {
+      const pnJid = await sock?.signalRepository?.lidMapping?.getPNForLID?.(lid);
+      const phone = phoneFromJid(pnJid);
+      if (phone) {
+        rememberLidPhone(eid, lid, phone);
+        resolved += 1;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return resolved;
 }
 
 /** Resolve LID→PN via USync (mesmo fluxo do Baileys ao enviar mensagem). */
@@ -365,14 +514,8 @@ async function resolveLidsViaUsync(sock, eid, lidJids) {
 
   for (let i = 0; i < pending.length; i += batchSize) {
     const batch = pending.slice(i, i + batchSize);
-    const pairs = await usyncQueryLidPairs(sock, batch, "message");
-    if (!pairs.length) {
-      console.warn(
-        `resolveLidsViaUsync ${eid}: 0 pares para LIDs ${batch.slice(0, 2).join(", ")}`
-      );
-      continue;
-    }
-
+    const { pairs } = await usyncQueryLidPairs(sock, batch, eid, "message");
+    if (!pairs.length) continue;
     resolved += await storeLidPnPairs(sock, eid, pairs);
   }
 
@@ -384,47 +527,60 @@ async function resolveLidsViaUsync(sock, eid, lidJids) {
 }
 
 async function preflightHistoryLids(eid, sock, messages, chats, contacts) {
-  if (!sock) return 0;
+  if (!sock) return { total: 0, local: 0, usync: 0 };
 
   const lids = collectLidJids(messages, chats, contacts);
   const pending = unresolvedLidJids(eid, lids);
-  if (!pending.length) return 0;
+  if (!pending.length) return { total: 0, local: 0, usync: 0 };
 
-  let resolved = await resolveLidsViaUsync(sock, eid, pending);
+  let local = await resolveLidsFromLocalSources(eid, sock, pending);
+  let usync = await resolveLidsViaUsync(sock, eid, pending);
 
-  for (const lid of pending) {
-    if (getLidMap(eid).get(lid)) continue;
-    try {
-      const pnJid = await sock.signalRepository?.lidMapping?.getPNForLID?.(lid);
-      const phone = phoneFromJid(pnJid);
-      if (phone) {
-        rememberLidPhone(eid, lid, phone);
-        resolved += 1;
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-
-  if (resolved > 0) {
+  if (local + usync > 0) {
     await saveLidMap(eid);
   }
 
-  return resolved;
+  return { total: local + usync, local, usync };
 }
 
 async function resolveLidsFromChatsCache(eid, sock) {
   const chats = await loadChatsCache(eid);
   const lids = collectLidJids(chats, [], []);
   if (!lids.length) return 0;
-  return resolveLidsViaUsync(sock, eid, lids);
+
+  let resolved = await resolveLidsFromLocalSources(eid, sock, lids);
+  resolved += await resolveLidsViaUsync(sock, eid, lids);
+  if (resolved > 0) {
+    await saveLidMap(eid);
+  }
+  return resolved;
+}
+
+async function retryUnresolvedLids(eid, sock, delayMs = 8000) {
+  if (!sock || !clients[eid]) return;
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
+
+  const chats = await loadChatsCache(eid);
+  const lids = collectLidJids(chats, [], []);
+  const pending = unresolvedLidJids(eid, lids);
+  if (!pending.length) return;
+
+  const local = await resolveLidsFromLocalSources(eid, sock, pending);
+  const usync = await resolveLidsViaUsync(sock, eid, pending);
+  if (local + usync > 0) {
+    await saveLidMap(eid);
+    console.log(
+      `lid-retry ${eid}: +${local + usync} (local=${local}, usync=${usync}) apos ${delayMs}ms`
+    );
+  }
 }
 
 async function finalizeHistorySync(eid, sock) {
   const cacheResolved = await resolveLidsFromChatsCache(eid, sock);
   if (cacheResolved > 0) {
-    console.log(`history ${eid}: ${cacheResolved} LIDs resolvidos via chats-cache`);
+    console.log(`history ${eid}: ${cacheResolved} LIDs resolvidos via chats-cache/local`);
   }
+  retryUnresolvedLids(eid, sock, 6000).catch(() => {});
   finishHistorySync(eid, "Historico sincronizado.");
 }
 
@@ -823,6 +979,10 @@ function contactPhoneFromBaileys(contact, eid = "") {
     if (mapped) {
       return normalizePhone(mapped);
     }
+    const lidUser = lidUserFromJid(id);
+    if (lidUser) {
+      return lidUser;
+    }
   }
 
   return "";
@@ -1010,12 +1170,33 @@ function beginHistorySync(eid) {
   return promise;
 }
 
+async function forwardLidPushNamesFromMessages(eid, messages) {
+  const byJid = new Map();
+  for (const msg of messages || []) {
+    const jid = String(msg?.key?.remoteJid || "");
+    const pushName = String(msg?.pushName || msg?.verifiedBizName || "").trim();
+    if (!isLidJid(jid) || !pushName) continue;
+    if (!byJid.has(jid)) {
+      byJid.set(jid, {
+        phone: lidUserFromJid(jid),
+        name: pushName,
+        jid,
+      });
+    }
+  }
+
+  const contacts = [...byJid.values()].filter((c) => c.phone);
+  if (!contacts.length) return;
+  await forwardContactsToRapidex(eid, contacts);
+}
+
 async function forwardHistoryBatch(eid, messages, sock = null) {
   if (!WEBHOOK_TOKEN || !messages?.length) {
     return { imported: 0, skipped: 0 };
   }
 
   await preflightHistoryLids(eid, sock, messages, [], []);
+  await forwardLidPushNamesFromMessages(eid, messages);
 
   const payloads = [];
   for (const msg of messages) {
@@ -1339,6 +1520,7 @@ async function startClient(rawEid) {
     const authPath = sessionPath(eid);
     await fs.ensureDir(authPath);
     await loadLidMap(eid);
+    await bootstrapLidMapFromAuthFiles(eid);
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -1375,6 +1557,7 @@ async function startClient(rawEid) {
         if (await fs.pathExists(qrFile(eid))) await fs.remove(qrFile(eid));
         await upsertSession(eid, { status: "connected", last_qr: null });
         scheduleHistoryBootstrap(eid, sock);
+        retryUnresolvedLids(eid, sock, 10000).catch(() => {});
       }
 
       if (connection === "close") {
@@ -1399,7 +1582,9 @@ async function startClient(rawEid) {
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("lid-mapping.update", ({ lid, pn }) => {
-      rememberLidPhone(eid, lid, pn);
+      const phone = phoneFromJid(pn) || normalizePhone(pn);
+      rememberLidPhone(eid, lid, phone || pn);
+      console.log(`lid-mapping.update ${eid}: ${lid} -> ${phone || pn || "?"}`);
     });
 
     sock.ev.on("messaging-history.set", async ({ chats, messages, contacts, isLatest, progress }) => {
@@ -1429,7 +1614,7 @@ async function startClient(rawEid) {
         ingestLidMappings(eid, contacts, chats);
         ingestLidFromMessages(eid, chats, messages);
         const signalPairs = await syncLidMappingsToSignalStore(sock, contacts, chats);
-        const usyncResolved = await preflightHistoryLids(
+        const lidResolve = await preflightHistoryLids(
           eid,
           sock,
           messages,
@@ -1439,9 +1624,9 @@ async function startClient(rawEid) {
         await saveLidMap(eid);
         const mapSize = getLidMap(eid).size;
         console.log(
-          `history ${eid}: chunk chats=${nChat} msgs=${nMsg} contacts=${nContact} | lid-map ${mapSize}, usync ${usyncResolved} (progress=${progress ?? "?"})`
+          `history ${eid}: chunk chats=${nChat} msgs=${nMsg} contacts=${nContact} | lid-map ${mapSize}, resolved ${lidResolve.total} (local=${lidResolve.local}, usync=${lidResolve.usync}) (progress=${progress ?? "?"})`
         );
-        if (mapSize === 0 && usyncResolved === 0 && (nMsg > 0 || nChat > 0)) {
+        if (mapSize === 0 && lidResolve.total === 0 && (nMsg > 0 || nChat > 0)) {
           logHistoryDebug(eid, chats, contacts, messages);
         }
 
