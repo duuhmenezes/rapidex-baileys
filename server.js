@@ -125,11 +125,9 @@ function ingestLidMappings(eid, contacts = [], chats = []) {
 
   for (const contact of contacts) {
     const pn = String(contact?.phoneNumber || contact?.pnJid || "");
-    let phone = "";
-    if (pn.includes("@s.whatsapp.net")) {
-      phone = pn.split("@")[0];
-    } else if (pn) {
-      phone = pn;
+    let phone = phoneFromJid(pn);
+    if (!phone && pn) {
+      phone = normalizePhone(pn);
     }
     if (!phone) continue;
 
@@ -142,11 +140,38 @@ function ingestLidMappings(eid, contacts = [], chats = []) {
 
   for (const chat of chats) {
     const pnJid = String(chat?.pnJid || "");
-    if (!pnJid.includes("@s.whatsapp.net")) continue;
-    const phone = pnJid.split("@")[0];
+    const phone = phoneFromJid(pnJid);
+    if (!phone) continue;
     rememberPair(chat?.lidJid || chat?.id, phone);
     if (String(chat?.id || "").endsWith("@lid")) {
       rememberPair(chat.id, phone);
+    }
+  }
+}
+
+/** Cruza msgs do historico com chats/contatos para montar lid-map. */
+function ingestLidFromMessages(eid, chats = [], messages = []) {
+  const chatById = new Map();
+  for (const chat of chats) {
+    if (chat?.id) chatById.set(String(chat.id), chat);
+  }
+
+  for (const msg of messages) {
+    const remoteJid = String(msg?.key?.remoteJid || "");
+    const altJid = String(
+      msg?.key?.remoteJidAlt || msg?.key?.participantAlt || ""
+    );
+
+    if (remoteJid.endsWith("@lid") && isPnJid(altJid)) {
+      rememberLidPhone(eid, remoteJid, phoneFromJid(altJid));
+    }
+
+    if (remoteJid.endsWith("@lid")) {
+      const chat = chatById.get(remoteJid);
+      const pn = String(chat?.pnJid || "");
+      if (pn) {
+        rememberLidPhone(eid, remoteJid, phoneFromJid(pn));
+      }
     }
   }
 }
@@ -350,6 +375,19 @@ function messagePlaceholder(msg) {
   return "";
 }
 
+function isPnJid(jid) {
+  const j = String(jid || "");
+  return j.endsWith("@s.whatsapp.net") || j.endsWith("@hosted");
+}
+
+/** Extrai telefone do user part do JID (ignora sufixo :device). */
+function phoneFromJid(jid) {
+  const raw = String(jid || "").trim();
+  if (!raw) return "";
+  const user = raw.split("@")[0].split(":")[0];
+  return normalizePhone(user);
+}
+
 function resolveContact(msg, eid = "") {
   const remoteJid = String(msg.key?.remoteJid || "");
   const altJid = String(
@@ -361,8 +399,8 @@ function resolveContact(msg, eid = "") {
   const map = eid ? getLidMap(eid) : new Map();
 
   for (const jid of [altJid, remoteJid]) {
-    if (!jid.endsWith("@s.whatsapp.net")) continue;
-    const phone = normalizePhone(jid.split("@")[0]);
+    if (!isPnJid(jid)) continue;
+    const phone = phoneFromJid(jid);
     if (phone) {
       return { jid: remoteJid || jid, phone };
     }
@@ -382,12 +420,44 @@ function resolveContact(msg, eid = "") {
   return { jid: remoteJid, phone: "" };
 }
 
-function messageToPayload(msg, eid = "") {
+async function resolveContactAsync(msg, eid = "", sock = null) {
+  const base = resolveContact(msg, eid);
+  if (base.phone) return base;
+
+  const remoteJid = String(msg.key?.remoteJid || "");
+  const altJid = String(
+    msg.key?.remoteJidAlt ||
+      msg.key?.participantAlt ||
+      msg.key?.participant ||
+      ""
+  );
+  const lidMapping = sock?.signalRepository?.lidMapping;
+
+  if (lidMapping?.getPNForLID) {
+    for (const jid of [remoteJid, altJid]) {
+      if (!jid.endsWith("@lid")) continue;
+      try {
+        const pnJid = await lidMapping.getPNForLID(jid);
+        const phone = phoneFromJid(pnJid);
+        if (phone) {
+          rememberLidPhone(eid, jid, phone);
+          return { jid: remoteJid || jid, phone };
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  return base;
+}
+
+async function messageToPayloadAsync(msg, eid = "", sock = null) {
   if (!msg?.message || !msg.key?.remoteJid || shouldSkipJid(msg.key.remoteJid)) {
     return null;
   }
 
-  const contact = resolveContact(msg, eid);
+  const contact = await resolveContactAsync(msg, eid, sock);
   const texto = messagePlaceholder(msg);
   if (!contact.phone || !texto) return null;
 
@@ -411,16 +481,16 @@ function contactDisplayName(contact) {
 function contactPhoneFromBaileys(contact, eid = "") {
   const map = eid ? getLidMap(eid) : new Map();
   const pn = String(contact?.phoneNumber || contact?.pnJid || "");
-  if (pn.includes("@s.whatsapp.net")) {
-    return normalizePhone(pn.split("@")[0]);
+  if (isPnJid(pn)) {
+    return phoneFromJid(pn);
   }
   if (pn) {
     return normalizePhone(pn);
   }
 
   const id = String(contact?.id || "");
-  if (id.endsWith("@s.whatsapp.net")) {
-    return normalizePhone(id.split("@")[0]);
+  if (isPnJid(id)) {
+    return phoneFromJid(id);
   }
 
   const lid = String(contact?.lid || contact?.lidJid || "");
@@ -606,14 +676,16 @@ function beginHistorySync(eid) {
   return promise;
 }
 
-async function forwardHistoryBatch(eid, messages) {
+async function forwardHistoryBatch(eid, messages, sock = null) {
   if (!WEBHOOK_TOKEN || !messages?.length) {
     return { imported: 0, skipped: 0 };
   }
 
-  const payloads = messages
-    .map((msg) => messageToPayload(msg, eid))
-    .filter(Boolean);
+  const payloads = [];
+  for (const msg of messages) {
+    const row = await messageToPayloadAsync(msg, eid, sock);
+    if (row) payloads.push(row);
+  }
 
   if (!payloads.length) {
     console.warn(
@@ -621,6 +693,10 @@ async function forwardHistoryBatch(eid, messages) {
     );
     return { imported: 0, skipped: messages.length };
   }
+
+  console.log(
+    `history ${eid}: ${payloads.length}/${messages.length} msgs com telefone valido`
+  );
 
   const sync = activeHistorySync[eid];
   if (sync) sync.pendingBatches += 1;
@@ -677,7 +753,7 @@ async function processLiveMessage(sock, eid, msg) {
     return;
   }
 
-  const contact = resolveContact(msg, eid);
+  const contact = await resolveContactAsync(msg, eid, sock);
   const numero = contact.phone;
   const waJid = contact.jid;
   if (!numero || !waJid) return;
@@ -990,6 +1066,7 @@ async function startClient(rawEid) {
         }
 
         ingestLidMappings(eid, contacts, chats);
+        ingestLidFromMessages(eid, chats, messages);
         await saveLidMap(eid);
         console.log(
           `history ${eid}: lid-map ${getLidMap(eid).size} entradas antes de importar msgs`
@@ -1010,7 +1087,7 @@ async function startClient(rawEid) {
         console.log(
           `history ${eid}: ${batch.length} msgs (latest=${!!isLatest}, progress=${progress ?? "?"})`
         );
-        await forwardHistoryBatch(eid, batch);
+        await forwardHistoryBatch(eid, batch, sock);
 
         if (isLatest) {
           finishHistorySync(eid, "Historico sincronizado.");
@@ -1067,7 +1144,7 @@ async function startClient(rawEid) {
             (msg) => msg?.message && msg.key?.remoteJid && !shouldSkipJid(msg.key.remoteJid)
           );
           if (batch.length) {
-            await forwardHistoryBatch(eid, batch);
+            await forwardHistoryBatch(eid, batch, sock);
           }
         }
       } catch (err) {
@@ -1101,7 +1178,7 @@ async function restoreSessions() {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.3" });
+  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.4" });
 });
 
 app.get("/status", async (req, res) => {
@@ -1295,7 +1372,7 @@ process.on("SIGTERM", () => {
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.2.3 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.2.4 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   console.log(`historyWebhook=${HISTORY_WEBHOOK_URL}`);
   if (!WEBHOOK_TOKEN) {
