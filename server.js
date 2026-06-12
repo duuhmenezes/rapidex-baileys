@@ -109,6 +109,48 @@ function rememberLidPhone(eid, lid, phone) {
   saveLidMap(eid).catch(() => {});
 }
 
+/** Preenche lid-map a partir de contatos/chats do historico (antes de importar msgs). */
+function ingestLidMappings(eid, contacts = [], chats = []) {
+  const rememberPair = (lidRaw, phoneRaw) => {
+    const phone = normalizePhone(phoneRaw);
+    if (!phone) return;
+    let lid = String(lidRaw || "").trim();
+    if (!lid) return;
+    if (!lid.includes("@")) {
+      lid = `${lid}@lid`;
+    }
+    if (!lid.endsWith("@lid")) return;
+    rememberLidPhone(eid, lid, phone);
+  };
+
+  for (const contact of contacts) {
+    const pn = String(contact?.phoneNumber || contact?.pnJid || "");
+    let phone = "";
+    if (pn.includes("@s.whatsapp.net")) {
+      phone = pn.split("@")[0];
+    } else if (pn) {
+      phone = pn;
+    }
+    if (!phone) continue;
+
+    rememberPair(contact?.lid || contact?.lidJid, phone);
+    rememberPair(
+      String(contact?.id || "").endsWith("@lid") ? contact.id : "",
+      phone
+    );
+  }
+
+  for (const chat of chats) {
+    const pnJid = String(chat?.pnJid || "");
+    if (!pnJid.includes("@s.whatsapp.net")) continue;
+    const phone = pnJid.split("@")[0];
+    rememberPair(chat?.lidJid || chat?.id, phone);
+    if (String(chat?.id || "").endsWith("@lid")) {
+      rememberPair(chat.id, phone);
+    }
+  }
+}
+
 function chatsCacheFile(eid) {
   return `${sessionPath(eid)}/chats-cache.json`;
 }
@@ -310,20 +352,19 @@ function messagePlaceholder(msg) {
 
 function resolveContact(msg, eid = "") {
   const remoteJid = String(msg.key?.remoteJid || "");
-  const altJid = String(msg.key?.remoteJidAlt || msg.key?.participant || "");
+  const altJid = String(
+    msg.key?.remoteJidAlt ||
+      msg.key?.participantAlt ||
+      msg.key?.participant ||
+      ""
+  );
   const map = eid ? getLidMap(eid) : new Map();
 
-  if (altJid.endsWith("@s.whatsapp.net")) {
-    const phone = normalizePhone(altJid.split("@")[0]);
+  for (const jid of [altJid, remoteJid]) {
+    if (!jid.endsWith("@s.whatsapp.net")) continue;
+    const phone = normalizePhone(jid.split("@")[0]);
     if (phone) {
-      return { jid: remoteJid || altJid, phone };
-    }
-  }
-
-  if (remoteJid.endsWith("@s.whatsapp.net")) {
-    const phone = normalizePhone(remoteJid.split("@")[0]);
-    if (phone) {
-      return { jid: remoteJid, phone };
+      return { jid: remoteJid || jid, phone };
     }
   }
 
@@ -369,7 +410,7 @@ function contactDisplayName(contact) {
 
 function contactPhoneFromBaileys(contact, eid = "") {
   const map = eid ? getLidMap(eid) : new Map();
-  const pn = String(contact?.phoneNumber || "");
+  const pn = String(contact?.phoneNumber || contact?.pnJid || "");
   if (pn.includes("@s.whatsapp.net")) {
     return normalizePhone(pn.split("@")[0]);
   }
@@ -380,6 +421,14 @@ function contactPhoneFromBaileys(contact, eid = "") {
   const id = String(contact?.id || "");
   if (id.endsWith("@s.whatsapp.net")) {
     return normalizePhone(id.split("@")[0]);
+  }
+
+  const lid = String(contact?.lid || contact?.lidJid || "");
+  if (lid.endsWith("@lid")) {
+    const mapped = map.get(lid);
+    if (mapped) {
+      return normalizePhone(mapped);
+    }
   }
   if (id.endsWith("@lid")) {
     const mapped = map.get(id);
@@ -939,6 +988,13 @@ async function startClient(rawEid) {
         if (chats?.length) {
           await mergeChatsCache(eid, chats);
         }
+
+        ingestLidMappings(eid, contacts, chats);
+        await saveLidMap(eid);
+        console.log(
+          `history ${eid}: lid-map ${getLidMap(eid).size} entradas antes de importar msgs`
+        );
+
         if (contacts?.length) {
           await forwardContactsToRapidex(eid, contacts, sock);
         }
@@ -966,7 +1022,11 @@ async function startClient(rawEid) {
 
     sock.ev.on("chats.upsert", async (chats) => {
       try {
-        if (chats?.length) await mergeChatsCache(eid, chats);
+        if (chats?.length) {
+          await mergeChatsCache(eid, chats);
+          ingestLidMappings(eid, [], chats);
+          await saveLidMap(eid);
+        }
       } catch (err) {
         console.error(`chats.upsert ${eid}:`, err.message);
       }
@@ -975,9 +1035,21 @@ async function startClient(rawEid) {
     sock.ev.on("contacts.upsert", async (contacts) => {
       try {
         if (!contacts?.length) return;
+        ingestLidMappings(eid, contacts, []);
+        await saveLidMap(eid);
         await forwardContactsToRapidex(eid, contacts, sock);
       } catch (err) {
         console.error(`contacts.upsert ${eid}:`, err.message);
+      }
+    });
+
+    sock.ev.on("contacts.update", async (contacts) => {
+      try {
+        if (!contacts?.length) return;
+        ingestLidMappings(eid, contacts, []);
+        await saveLidMap(eid);
+      } catch (err) {
+        console.error(`contacts.update ${eid}:`, err.message);
       }
     });
 
@@ -1029,7 +1101,7 @@ async function restoreSessions() {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.2" });
+  res.json({ ok: true, service: "rapidex-baileys", version: "2.2.3" });
 });
 
 app.get("/status", async (req, res) => {
@@ -1223,7 +1295,7 @@ process.on("SIGTERM", () => {
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.2.2 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.2.3 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   console.log(`historyWebhook=${HISTORY_WEBHOOK_URL}`);
   if (!WEBHOOK_TOKEN) {
