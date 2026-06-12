@@ -733,25 +733,48 @@ async function resolveContactAsync(msg, eid = "", sock = null) {
   return base;
 }
 
-async function messageToPayloadAsync(msg, eid = "", sock = null) {
-  if (!msg?.message || !msg.key?.remoteJid || shouldSkipJid(msg.key.remoteJid)) {
-    return null;
-  }
+async function resolveMessageContact(msg, eid = "", sock = null) {
+  const remoteJid = String(msg?.key?.remoteJid || "");
+  const altJid = String(
+    msg?.key?.remoteJidAlt ||
+      msg?.key?.participantAlt ||
+      msg?.key?.participant ||
+      ""
+  );
 
   const contact = await resolveContactAsync(msg, eid, sock);
-  const texto = messagePlaceholder(msg);
-  if (!texto) return null;
-
   let phone = contact.phone;
-  let jid = String(contact.jid || msg.key.remoteJid || "");
-  const remoteJid = String(msg.key.remoteJid || "");
+  let jid = String(contact.jid || remoteJid);
+
+  if (isPnJid(altJid)) {
+    const pn = phoneFromJid(altJid);
+    if (pn) {
+      phone = pn;
+      if (isLidJid(remoteJid)) {
+        rememberLidPhone(eid, remoteJid, pn);
+        jid = remoteJid;
+      }
+    }
+  }
 
   if (!phone && isLidJid(remoteJid)) {
     phone = lidUserFromJid(remoteJid);
     jid = remoteJid;
   }
 
-  if (!phone) return null;
+  return { phone, jid, remoteJid };
+}
+
+async function messageToPayloadAsync(msg, eid = "", sock = null) {
+  if (!msg?.message || !msg.key?.remoteJid || shouldSkipJid(msg.key.remoteJid)) {
+    return null;
+  }
+
+  const texto = messagePlaceholder(msg);
+  if (!texto) return null;
+
+  const { phone, jid } = await resolveMessageContact(msg, eid, sock);
+  if (!phone || !jid) return null;
 
   return {
     from: phone,
@@ -1070,22 +1093,20 @@ async function processLiveMessage(sock, eid, msg) {
     return;
   }
 
-  const contact = await resolveContactAsync(msg, eid, sock);
-  const numero = contact.phone;
-  const waJid = contact.jid;
-  if (!numero || !waJid) return;
-
   const texto = messagePlaceholder(msg);
   if (!texto) return;
+
+  const { phone, jid } = await resolveMessageContact(msg, eid, sock);
+  if (!phone || !jid) return;
 
   const fromMe = !!msg.key.fromMe;
   const pushName = msg.pushName || msg.verifiedBizName || "";
   const msgId = String(msg.key.id || "");
 
-  forwardToRapidex(eid, numero, texto, fromMe, pushName, waJid, msgId).catch(
+  forwardToRapidex(eid, phone, texto, fromMe, pushName, jid, msgId).catch(
     () => {}
   );
-  maybeForwardToGroup(sock, eid, msg.key.remoteJid, msg, numero, texto).catch(
+  maybeForwardToGroup(sock, eid, msg.key.remoteJid, msg, phone, texto).catch(
     () => {}
   );
 }
@@ -1529,7 +1550,7 @@ async function restoreSessions() {
 }
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "rapidex-baileys", version: "2.3.1" });
+  res.json({ ok: true, service: "rapidex-baileys", version: "2.3.2" });
 });
 
 app.get("/status", async (req, res) => {
@@ -1723,7 +1744,7 @@ process.on("SIGTERM", () => {
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.3.0 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.3.2 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   console.log(`historyWebhook=${HISTORY_WEBHOOK_URL}`);
   if (!WEBHOOK_TOKEN) {
