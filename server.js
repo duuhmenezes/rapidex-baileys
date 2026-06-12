@@ -413,6 +413,21 @@ async function preflightHistoryLids(eid, sock, messages, chats, contacts) {
   return resolved;
 }
 
+async function resolveLidsFromChatsCache(eid, sock) {
+  const chats = await loadChatsCache(eid);
+  const lids = collectLidJids(chats, [], []);
+  if (!lids.length) return 0;
+  return resolveLidsViaUsync(sock, eid, lids);
+}
+
+async function finalizeHistorySync(eid, sock) {
+  const cacheResolved = await resolveLidsFromChatsCache(eid, sock);
+  if (cacheResolved > 0) {
+    console.log(`history ${eid}: ${cacheResolved} LIDs resolvidos via chats-cache`);
+  }
+  finishHistorySync(eid, "Historico sincronizado.");
+}
+
 function logHistoryDebug(eid, chats, contacts, messages) {
   const sampleMsgs = (messages || []).slice(0, 2).map((m) => ({
     remoteJid: m?.key?.remoteJid,
@@ -984,7 +999,7 @@ async function forwardHistoryBatch(eid, messages, sock = null) {
   }
 
   console.log(
-    `history ${eid}: ${payloads.length}/${messages.length} msgs com telefone valido`
+    `history ${eid}: ${payloads.length}/${messages.length} msgs -> webhook (${payloads.filter((p) => String(p.jid || "").includes("@lid")).length} via @lid)`
   );
 
   const sync = activeHistorySync[eid];
@@ -1010,6 +1025,9 @@ async function forwardHistoryBatch(eid, messages, sock = null) {
         if (res.ok) {
           imported += Number(data.imported ?? chunk.length);
           skipped += Number(data.skipped ?? 0);
+          console.log(
+            `history ${eid}: webhook ok imported=${data.imported ?? "?"} skipped=${data.skipped ?? "?"}`
+          );
         } else {
           skipped += chunk.length;
           console.error(`history webhook ${eid}: HTTP ${res.status}`);
@@ -1356,6 +1374,20 @@ async function startClient(rawEid) {
         clearTimeout(historyBootstrapTimers[eid]);
         delete historyBootstrapTimers[eid];
 
+        const nMsg = (messages || []).length;
+        const nChat = (chats || []).length;
+        const nContact = (contacts || []).length;
+
+        if (nMsg === 0 && nChat === 0 && nContact === 0) {
+          console.log(
+            `history ${eid}: chunk metadata vazio (progress=${progress ?? "?"}, latest=${!!isLatest})`
+          );
+          if (isLatest) {
+            await finalizeHistorySync(eid, sock);
+          }
+          return;
+        }
+
         if (chats?.length) {
           await mergeChatsCache(eid, chats);
         }
@@ -1373,9 +1405,9 @@ async function startClient(rawEid) {
         await saveLidMap(eid);
         const mapSize = getLidMap(eid).size;
         console.log(
-          `history ${eid}: lid-map ${mapSize} entradas, signal ${signalPairs} pares, usync ${usyncResolved} resolvidos`
+          `history ${eid}: chunk chats=${nChat} msgs=${nMsg} contacts=${nContact} | lid-map ${mapSize}, usync ${usyncResolved} (progress=${progress ?? "?"})`
         );
-        if (mapSize === 0 && signalPairs === 0) {
+        if (mapSize === 0 && usyncResolved === 0 && (nMsg > 0 || nChat > 0)) {
           logHistoryDebug(eid, chats, contacts, messages);
         }
 
@@ -1387,17 +1419,19 @@ async function startClient(rawEid) {
           (msg) => msg?.message && msg.key?.remoteJid && !shouldSkipJid(msg.key.remoteJid)
         );
         if (!batch.length) {
-          if (isLatest) finishHistorySync(eid, "Historico sincronizado.");
+          if (isLatest) {
+            await finalizeHistorySync(eid, sock);
+          }
           return;
         }
 
         console.log(
-          `history ${eid}: ${batch.length} msgs (latest=${!!isLatest}, progress=${progress ?? "?"})`
+          `history ${eid}: importando ${batch.length} msgs (latest=${!!isLatest})`
         );
         await forwardHistoryBatch(eid, batch, sock);
 
         if (isLatest) {
-          finishHistorySync(eid, "Historico sincronizado.");
+          await finalizeHistorySync(eid, sock);
         }
       } catch (err) {
         console.error(`messaging-history.set ${eid}:`, err.message);
