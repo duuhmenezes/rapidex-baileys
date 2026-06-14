@@ -40,7 +40,7 @@ const corsOrigins = (process.env.CORS_ORIGINS || "")
   .filter(Boolean);
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "32mb" }));
 app.use(
   cors({
     origin: corsOrigins.length
@@ -1408,6 +1408,113 @@ async function sendTextMessage(eid, to, message, jid = "") {
   }
 }
 
+const MAX_MEDIA_BYTES = 16 * 1024 * 1024;
+
+async function resolveMediaBuffer({ url, b64 }) {
+  const mediaUrl = String(url || "").trim();
+  if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
+    try {
+      const res = await fetch(mediaUrl, { signal: AbortSignal.timeout(45000) });
+      if (res.ok) {
+        const ab = await res.arrayBuffer();
+        const buf = Buffer.from(ab);
+        if (buf.length > 0 && buf.length <= MAX_MEDIA_BYTES) {
+          return buf;
+        }
+      }
+    } catch (err) {
+      console.warn("send-media: url fetch failed:", err.message);
+    }
+  }
+
+  const raw = String(b64 || "").trim();
+  if (!raw) {
+    return null;
+  }
+
+  const buf = Buffer.from(raw, "base64");
+  if (buf.length === 0 || buf.length > MAX_MEDIA_BYTES) {
+    return null;
+  }
+
+  return buf;
+}
+
+async function sendMediaMessage(eid, to, opts, jid = "") {
+  const key = String(eid);
+  const status = await readStatus(key);
+
+  if (status !== "connected" || !clients[key]) {
+    return { success: false, error: "not_connected" };
+  }
+
+  const mediaType = String(opts.mediaType || "").toLowerCase();
+  const caption = String(opts.caption || "").trim();
+  const mimetype = String(opts.mimetype || "").trim();
+  const fileName = String(opts.fileName || "arquivo").trim();
+
+  if (!["image", "video", "audio", "document"].includes(mediaType)) {
+    return { success: false, error: "invalid_media_type" };
+  }
+
+  const buffer = await resolveMediaBuffer(opts);
+  if (!buffer) {
+    return { success: false, error: "media_missing" };
+  }
+
+  try {
+    const sock = clients[key];
+    const target = await resolveSendTarget(sock, key, to, jid);
+    if (!target) {
+      return { success: false, error: "invalid_number" };
+    }
+
+    /** @type {Record<string, unknown>} */
+    let payload;
+
+    switch (mediaType) {
+      case "image":
+        payload = {
+          image: buffer,
+          mimetype: mimetype || "image/jpeg",
+        };
+        if (caption) payload.caption = caption;
+        break;
+      case "video":
+        payload = {
+          video: buffer,
+          mimetype: mimetype || "video/mp4",
+        };
+        if (caption) payload.caption = caption;
+        break;
+      case "audio":
+        payload = {
+          audio: buffer,
+          mimetype: mimetype || "audio/mpeg",
+          ptt: false,
+        };
+        break;
+      default:
+        payload = {
+          document: buffer,
+          mimetype: mimetype || "application/octet-stream",
+          fileName,
+        };
+        if (caption) payload.caption = caption;
+        break;
+    }
+
+    console.log(
+      `send-media ${key}: -> ${target} type=${mediaType} bytes=${buffer.length}`
+    );
+    await sock.sendMessage(target, payload);
+    return { success: true, jid: target };
+  } catch (err) {
+    console.error(`send-media ${key}:`, err.message);
+    return { success: false, error: err.message || "send_failed" };
+  }
+}
+
 async function requestHistoryFromCachedChats(eid, sock) {
   const chats = await loadChatsCache(eid);
   if (!chats.length) {
@@ -1854,12 +1961,68 @@ app.post("/send", async (req, res) => {
   const to = req.body?.to;
   const message = req.body?.message;
   const jid = String(req.body?.jid || "").trim();
+  const mediaType = String(req.body?.mediaType || req.body?.type || "").trim().toLowerCase();
+  const hasMedia =
+    mediaType !== "" &&
+    (String(req.body?.media || "").trim() !== "" ||
+      String(req.body?.url || "").trim() !== "");
+
+  if (hasMedia) {
+    const result = await sendMediaMessage(
+      eid,
+      to,
+      {
+        caption: String(req.body?.caption || message || "").trim(),
+        mediaType,
+        mimetype: String(req.body?.mimetype || "").trim(),
+        fileName: String(req.body?.fileName || "arquivo").trim(),
+        url: String(req.body?.url || "").trim(),
+        b64: String(req.body?.media || "").trim(),
+      },
+      jid
+    );
+    if (!result.success) {
+      return res.status(result.error === "not_connected" ? 503 : 400).json(result);
+    }
+    return res.json(result);
+  }
 
   if (!eid || !message || (!to && !jid)) {
     return res.status(400).json({ success: false, error: "missing_params" });
   }
 
   const result = await sendTextMessage(eid, to, message, jid);
+  if (!result.success) {
+    return res.status(result.error === "not_connected" ? 503 : 400).json(result);
+  }
+
+  res.json(result);
+});
+
+app.post("/send-media", async (req, res) => {
+  const eid = String(req.body?.eid || "").trim();
+  const to = req.body?.to;
+  const jid = String(req.body?.jid || "").trim();
+  const mediaType = String(req.body?.mediaType || req.body?.type || "").trim().toLowerCase();
+
+  if (!eid || (!to && !jid) || !mediaType) {
+    return res.status(400).json({ success: false, error: "missing_params" });
+  }
+
+  const result = await sendMediaMessage(
+    eid,
+    to,
+    {
+      caption: String(req.body?.caption || req.body?.message || "").trim(),
+      mediaType,
+      mimetype: String(req.body?.mimetype || "").trim(),
+      fileName: String(req.body?.fileName || "arquivo").trim(),
+      url: String(req.body?.url || "").trim(),
+      b64: String(req.body?.media || "").trim(),
+    },
+    jid
+  );
+
   if (!result.success) {
     return res.status(result.error === "not_connected" ? 503 : 400).json(result);
   }
@@ -1971,7 +2134,7 @@ process.on("SIGTERM", () => {
 
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`Rapidex Baileys v2.3.4 na porta ${PORT}`);
+  console.log(`Rapidex Baileys v2.3.5 na porta ${PORT}`);
   console.log(`syncFullHistory=${SYNC_FULL_HISTORY}`);
   console.log(`historyWebhook=${HISTORY_WEBHOOK_URL}`);
   if (!WEBHOOK_TOKEN) {

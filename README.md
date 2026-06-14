@@ -9,7 +9,8 @@ Microservico Node.js que mantem a sessao WhatsApp Web de cada loja (`eid`) e exp
 | GET | `/health` | Health check (Railway) |
 | GET | `/status?eid=` | Status da conexao |
 | GET | `/qr?eid=` | QR Code (data URL) |
-| POST | `/send` | Enviar mensagem (`eid`, `to`, `message`, `jid?`) |
+| POST | `/send` | Enviar texto (`eid`, `to`, `message`, `jid?`) ou midia se enviar `mediaType` + `url`/`media` |
+| POST | `/send-media` | Enviar midia (`eid`, `to`, `mediaType`, `url` ou `media` base64, `caption?`, `mimetype?`, `fileName?`) |
 | POST | `/sync-history?eid=` | Importar historico de conversas para o painel |
 | POST | `/disconnect?eid=` | Desconectar WhatsApp da loja |
 | POST | `/queue` | **Deprecated** — fila legada (usar cron PHP) |
